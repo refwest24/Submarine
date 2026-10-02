@@ -20,7 +20,7 @@ export default function InvitesSection({ onLocalProfilesChanged }: Props) {
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
 
-  const clean = (e: unknown) => String(e).replace(/^\[[A-Z_]+\]\s*/, "");
+  const clean = (e: unknown) => String(e).replace(/^\[[A-Z0-9_]+\]\s*/, "");
   const fail = (e: unknown) => { setErr(clean(e)); setOk(null); };
   const flash = (m: string) => { setOk(m); setErr(null); setTimeout(() => setOk(null), 5000); };
 

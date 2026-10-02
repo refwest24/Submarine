@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Plus, Trash2, X, AlertTriangle, ArrowRight, Download, Upload,
-  CheckCircle2, Cloud, CloudOff, HardDrive, ChevronDown, RefreshCw, ArrowUpCircle, Heart,
+  CheckCircle2, Cloud, CloudOff, HardDrive, ChevronDown, RefreshCw, ArrowUpCircle, Heart, Database,
 } from "lucide-react";
 import CloudPanel from "./CloudPanel";
 import AboutPanel from "./AboutPanel";
@@ -11,6 +11,9 @@ import { IS_ANDROID } from "../util/platform";
 import { useTextPrompt, useConfirm } from "../ui/confirm";
 
 interface CloudStatus { signed_in: boolean; email: string | null; }
+// Where personal profiles sync on this device (backend: sync_backend_get).
+// Only the non-secret fields the picker shows.
+interface SyncStorage { backend: "http" | "s3"; s3: { bucket: string; prefix: string }; credentials_ok: boolean; }
 // One personal profile as reported by the cloud (GET /sync/profiles). Names +
 // counts only — the server never sees the encrypted contents. `profile` is the
 // partition key (a name for legacy profiles, a UUID for new ones); `name` is the
@@ -59,6 +62,9 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // Cloud status surfaced directly on this page so the user doesn't have
   // to open the modal just to know if sync is connected or pending.
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ signed_in: false, email: null });
+  const [storage, setStorage] = useState<SyncStorage | null>(null);
+  // Personal profiles can be listed/restored: signed in, or an S3 bucket set up.
+  const listReady = storage?.backend === "s3" ? storage.credentials_ok && !!storage.s3.bucket : cloudStatus.signed_in;
   // Profiles that live in the signed-in cloud account. Merged with the local
   // list below so a fresh device SHOWS the user's profiles instead of making
   // them remember and type a name. Empty until signed in (or on network error).
@@ -76,7 +82,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const importNameRef = useRef<HTMLInputElement | null>(null);
 
   // Clean the [PREFIX] off backend errors for display.
-  const cleanErr = (e: unknown) => String(e).replace(/^\[[A-Z_]+\]\s*/, "");
+  const cleanErr = (e: unknown) => String(e).replace(/^\[[A-Z0-9_]+\]\s*/, "");
 
   const reload = async () => {
     setLoading(true); setError(null);
@@ -99,7 +105,10 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     try {
       const s = await invoke<CloudStatus>("cloud_status");
       setCloudStatus(s);
-      if (s.signed_in) {
+      const b = await invoke<SyncStorage>("sync_backend_get").catch(() => null);
+      setStorage(b);
+      const ready = b?.backend === "s3" ? b.credentials_ok && !!b.s3.bucket : s.signed_in;
+      if (ready) {
         try {
           const cps = await invoke<CloudProfile[]>("cloud_list_sync_profiles");
           // Hide empty / retired partitions (all-tombstone or escrow-only) —
@@ -475,7 +484,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
           <div className="space-y-3">
             <div className="flex items-center justify-between px-0.5">
               <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-500">Your profiles</span>
-              {cloudStatus.signed_in && (
+              {listReady && (
                 <button
                   onClick={refreshCloud}
                   disabled={busy}
@@ -585,7 +594,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
 
         {/* Cloud status bar — always visible. Signed-out shows a Connect
             link; signed-in shows the account email + a way into Manage. */}
-        <CloudBar status={cloudStatus} busy={busy} onManage={() => setCloudOpen(true)} />
+        <CloudBar status={cloudStatus} storage={storage} busy={busy} onManage={() => setCloudOpen(true)} />
 
         {/* About + Donate — a matched pair of pills, with a live "new version"
             notice underneath when one is available. */}
@@ -671,12 +680,38 @@ const RowAction = ({
 );
 
 const CloudBar = ({
-  status, busy, onManage,
+  status, storage, busy, onManage,
 }: {
   status: CloudStatus;
+  storage: SyncStorage | null;
   busy: boolean;
   onManage: () => void;
 }) => {
+  // Syncing through the user's own bucket: show where, and whether it's usable.
+  if (storage?.backend === "s3") {
+    const ready = storage.credentials_ok && !!storage.s3.bucket;
+    return (
+      <div className="mt-4 h-9 px-2.5 rounded-lg border border-white/5 bg-white/[0.02] flex items-center gap-2 text-[11.5px]">
+        <Database size={12} className="text-primary shrink-0" />
+        <span className="text-zinc-300 truncate font-mono flex-1 min-w-0">
+          {storage.s3.bucket || "—"}{storage.s3.prefix ? `/${storage.s3.prefix}` : ""}
+        </span>
+        {ready ? (
+          <span className="text-emerald-400 flex items-center gap-1 shrink-0"><CheckCircle2 size={11} /> S3</span>
+        ) : (
+          <span className="text-amber-300 flex items-center gap-1 shrink-0"><AlertTriangle size={11} /> Needs setup</span>
+        )}
+        <button
+          onClick={onManage}
+          disabled={busy}
+          title="Manage sync storage"
+          className="text-zinc-500 hover:text-primary disabled:opacity-50 shrink-0 p-0.5"
+        >
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg>
+        </button>
+      </div>
+    );
+  }
   // Signed-out: a thin, low-weight link rather than a fourth full-width
   // button — the user hasn't asked for cloud yet, so we don't want it
   // competing visually with the profile list.

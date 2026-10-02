@@ -5,6 +5,7 @@ import {
   LogOut, Mail, KeyRound, UserPlus, LogIn, Wand2,
 } from "lucide-react";
 import InvitesSection from "./InvitesSection";
+import SyncStorageSection from "./SyncStorageSection";
 
 // Cloud account panel, opened from the profile picker. Owns its own auth state;
 // the parent just mounts/unmounts. Signed-out is split into intent-first flows
@@ -287,6 +288,10 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
               <button onClick={() => setInfo(null)} className="text-emerald-200/70 hover:text-white"><X size={12} /></button>
             </div>
           )}
+
+          {/* Where personal profiles sync — here on the picker so a fresh device
+              can point at its bucket BEFORE restoring a profile from it. */}
+          <SyncStorageSection />
 
           {/* ----- Chooser ----- */}
           {stage === "chooser" && (

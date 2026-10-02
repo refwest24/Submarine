@@ -1,4 +1,5 @@
 import { Settings, Palette, RefreshCw, Pipette, List, Cloud } from "lucide-react";
+import SyncStorageSection from "./SyncStorageSection";
 
 const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
   const accentColors = [
@@ -195,6 +196,10 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
                 on the Profile tab, next to Sync now.
               </div>
             )}
+
+            <div className="border-t border-white/5 pt-4">
+              <SyncStorageSection />
+            </div>
           </div>
         </section>
 

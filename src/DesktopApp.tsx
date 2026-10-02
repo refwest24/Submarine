@@ -384,10 +384,14 @@ function DesktopApp() {
       addLog(`Cloud sync complete — pushed ${report.pushed}, pulled ${report.pulled}.`, "success");
     } catch (e) {
       const msg = String(e);
-      if (/NO_TOKEN|invalid_token|Missing auth|401/i.test(msg)) {
+      if (/NOT_SIGNED_IN|NO_TOKEN|invalid_token|Missing auth|401/i.test(msg)) {
         addLog("Cloud sync: not signed in. Open the Cloud panel from the profile picker and sign in first.", "error");
       } else if (/NO_PROFILE_OPEN|DB_NOT_OPEN|NO_KEY|NO_HLC/i.test(msg)) {
         addLog("Cloud sync: no profile open — unlock a profile first.", "error");
+      } else if (/^\[S3\] (NOT_CONFIGURED|CREDENTIALS_FILE|CONFIG_INVALID)/.test(msg)) {
+        addLog(`Sync storage isn't set up: ${msg.replace(/^\[S3\] [A-Z_]+:\s*/, "")} — fix it from the Cloud panel on the profile picker.`, "error");
+      } else if (msg.startsWith("[S3]")) {
+        addLog(`Sync to your bucket failed: ${msg.replace(/^\[S3\] [A-Z_]+:\s*/, "")}`, "error");
       } else {
         addLog(`Cloud sync failed: ${msg}`, "error");
       }
