@@ -22,6 +22,7 @@ mod mirror;
 mod docker;
 mod hlc;
 mod identity;
+mod sync_backend;
 use ssh_manager::SshState;
 use monitor::{MonitorMap, SharedSettings};
 use mirror::MirrorMap;
@@ -1385,9 +1386,9 @@ async fn sync_now(
         // Send the local display name so the server can label this partition —
         // essential once `cloud_profile` is an opaque UUID for new profiles. For
         // legacy `main` the name equals the partition, so it's a harmless echo.
-        let remote =
-            cloud::sync_exchange(&app, &cloud, &cloud_profile, "", &to_push, Some(profile.as_str())).await?;
-        (remote, to_push.len())
+        let transport = sync_backend::personal_transport(&app, &cloud)?;
+        let out = transport.exchange(&cloud_profile, &to_push, Some(profile.as_str())).await?;
+        (out.remote, out.pushed)
     };
     let pulled = remote.len();
 
@@ -1587,7 +1588,10 @@ async fn profile_sync_stats(
         let pulled = if let Some((share_id, _role)) = &share {
             cloud::shared_sync_exchange(&app, &cloud, share_id, "", &[]).await
         } else {
-            cloud::sync_exchange(&app, &cloud, &cloud_profile, "", &[], None).await
+            match sync_backend::personal_transport(&app, &cloud) {
+                Ok(transport) => transport.index(&cloud_profile).await,
+                Err(e) => Err(e),
+            }
         };
         match pulled {
             Ok(server) => Some(compute_sync_diff(&local, &server, &server_names)),
@@ -1993,22 +1997,23 @@ async fn restore_personal_profile(
         return Err("Password cannot be empty".into());
     }
 
-    // Peek at the cloud stream (empty push) and lift the escrow record out.
-    let peek = cloud::sync_exchange(&app, &cloud, &cloud_profile, "", &[], None).await?;
-    let sealed = peek
-        .iter()
-        .find(|r| r.entity_type == ESCROW_ETYPE && r.uuid == ESCROW_UUID)
-        .and_then(|r| r.blob.clone())
-        .ok_or("[SYNC] NO_ESCROW: no restorable copy of that profile in your cloud. Open it on the original device and sync once, then try again.")?;
+    // Fetch the published escrow blob(s). Normally exactly one; an object store
+    // can briefly hold two while a device replaces it, so each is tried below.
+    let sealed = sync_backend::personal_transport(&app, &cloud)?.escrows(&cloud_profile).await?;
+    if sealed.is_empty() {
+        return Err("[SYNC] NO_ESCROW: no restorable copy of that profile in your cloud. Open it on the original device and sync once, then try again.".into());
+    }
 
     // Re-derive the master key from the password (Argon2id → blocking pool) and
     // unseal the DEK. A wrong password fails the GCM tag → surfaced as a wrong
     // password below.
     let pw_for_escrow = vault_password.clone();
-    let dek = tokio::task::spawn_blocking(move || open_pw_escrow(&sealed, &pw_for_escrow))
-        .await
-        .map_err(|e| format!("[SYNC] ESCROW_JOIN: {e}"))?
-        .map_err(|_| "[SYNC] ESCROW_UNSEAL_FAILED: wrong password for this profile")?;
+    let dek = tokio::task::spawn_blocking(move || {
+        sealed.iter().find_map(|blob| open_pw_escrow(blob, &pw_for_escrow).ok())
+    })
+    .await
+    .map_err(|e| format!("[SYNC] ESCROW_JOIN: {e}"))?
+    .ok_or("[SYNC] ESCROW_UNSEAL_FAILED: wrong password for this profile")?;
     let dek_hex = hex::encode(dek);
 
     // Create the local vault (fresh profile) — same steps as create_profile.
@@ -3031,7 +3036,7 @@ async fn cloud_list_sync_profiles(
     app: tauri::AppHandle,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
 ) -> Result<Vec<cloud::SyncProfileInfo>, String> {
-    cloud::list_sync_profiles(&app, &cloud).await
+    sync_backend::personal_transport(&app, &cloud)?.list_profiles().await
 }
 
 /// Delete one of the caller's OWN personal profiles from the cloud: wipes every
@@ -3050,7 +3055,7 @@ async fn cloud_delete_profile(
     if profile.is_empty() {
         return Err("[SYNC] NO_PROFILE_NAME".into());
     }
-    cloud::delete_sync_profile(&app, &cloud, &profile).await
+    sync_backend::personal_transport(&app, &cloud)?.delete_profile(&profile).await
 }
 
 /// Replace this profile's entire cloud copy with what's on THIS device.
@@ -3094,7 +3099,7 @@ async fn force_push_profile(
     if share_id.is_some() {
         return Err("[SYNC] SHARED_PROFILE: this profile is shared with other people, and replacing the cloud copy would delete their changes too. Stop sharing first if you really want to reset it.".into());
     }
-    let removed = cloud::delete_sync_profile(&app, &cloud, &cloud_profile).await?;
+    let removed = sync_backend::personal_transport(&app, &cloud)?.delete_profile(&cloud_profile).await?;
     eprintln!("[SYNC] force push: server dropped {removed} record(s) for '{cloud_profile}'");
     // Pushes are always a full set, so the very next sync repopulates the
     // partition from this vault — including a fresh DEK escrow record.
