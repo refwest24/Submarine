@@ -2208,6 +2208,10 @@ struct ProfileShareStatus {
     identity_unlocked: bool,
     signed_in: bool,
     email: Option<String>,
+    /// Which transport personal (unshared) profiles sync over on this install.
+    backend: sync_backend::Backend,
+    /// Personal sync can run: signed in (HTTP) or configured (S3).
+    personal_sync_ready: bool,
 }
 
 /// Everything the in-app Profile panel needs about the OPEN profile, read in one
@@ -2216,6 +2220,7 @@ struct ProfileShareStatus {
 /// sharing identity are ready. The member roster is fetched separately.
 #[tauri::command]
 async fn profile_share_status(
+    app: tauri::AppHandle,
     db_state: tauri::State<'_, DbState>,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
 ) -> Result<ProfileShareStatus, String> {
@@ -2241,6 +2246,7 @@ async fn profile_share_status(
         }
     };
     let st = cloud.status().await;
+    let (backend, personal_sync_ready) = sync_backend::personal_sync_status(&app, &cloud).await;
     Ok(ProfileShareStatus {
         profile,
         share_id,
@@ -2248,6 +2254,8 @@ async fn profile_share_status(
         identity_unlocked: cloud.identity().await.is_some(),
         signed_in: st.signed_in,
         email: st.email,
+        backend,
+        personal_sync_ready,
     })
 }
 
@@ -10877,6 +10885,7 @@ pub fn run() {
             cloud::cloud_set_password, cloud::cloud_login, cloud::cloud_logout,
             cloud::cloud_request_password_reset, cloud::cloud_reset_password,
             cloud::cloud_request_login_link, cloud::cloud_login_with_link,
+            sync_backend::sync_backend_get, sync_backend::sync_backend_set, sync_backend::s3_test_connection,
             sync_now,
             identity_status, setup_identity, reset_identity,
             share_current_profile, invite_to_share, list_shares, share_member_list,

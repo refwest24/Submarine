@@ -345,6 +345,11 @@ impl S3Store {
         self.region.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
+    /// (endpoint, region in use) — for the connection test's report.
+    pub fn describe(&self) -> (String, String) {
+        (format!("{}://{}", self.scheme, self.authority), self.region())
+    }
+
     /// URL for `key` ("" = the bucket itself) with `query`, path pre-encoded so
     /// the signed path is exactly the sent path.
     fn url_for(&self, key: &str, query: &[(&str, &str)]) -> Result<url::Url, String> {
