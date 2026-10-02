@@ -104,6 +104,14 @@ ssh-key = { version = "0.6", features = ["alloc", "encryption", "getrandom", "ed
 tokio-socks = "0.5"
 async-http-proxy = { version = "1.2", features = ["runtime-tokio"] }
 async-trait = "0.1.89"
+# S3-compatible profile sync (src/s3_store.rs, src/sigv4.rs): SigV4 header
+# signing over the existing reqwest/rustls stack. hmac/time/url/
+# percent-encoding are already in the tree, so as direct deps they add no new
+# crates.
+hmac = "0.12"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+url = "2"
+percent-encoding = "2"
 russh-sftp = "2.1.2"
 notify = "6.1.1"
 # Debounces filesystem events so we don't try to upload a file mid-write.

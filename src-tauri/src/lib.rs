@@ -22,6 +22,9 @@ mod mirror;
 mod docker;
 mod hlc;
 mod identity;
+mod object_sync;
+mod s3_store;
+mod sigv4;
 mod sync_backend;
 use ssh_manager::SshState;
 use monitor::{MonitorMap, SharedSettings};
@@ -2971,6 +2974,163 @@ mod sync_engine_tests {
         let server = vec![rec("000000000000002:00000:A", false)];
         let d = compute_sync_diff(&local, &server, &std::collections::HashMap::new());
         assert_eq!((d.in_sync, d.needs_push, d.needs_pull), (1, 0, 0));
+    }
+
+    // ---- Two devices converging through an object store -------------------
+
+    use crate::object_sync::{mem::MemStore, ObjectSync};
+    use crate::sync_backend::SyncTransport;
+
+    /// One sync_now round for an in-memory device: collect → exchange → apply.
+    async fn bucket_sync(conn: &Connection, hlc: &hlc::Hlc, bucket: &dyn SyncTransport) {
+        let recs = collect_local_records(conn, &KEY, "").unwrap();
+        let out = bucket.exchange("p1", &recs, Some("work")).await.unwrap();
+        apply_remote_records(conn, &KEY, &out.remote, hlc).unwrap();
+    }
+
+    fn host_of(c: &Connection, name: &str) -> Option<String> {
+        c.query_row("SELECT host FROM servers WHERE name=?1", [name], |r| r.get(0)).ok()
+    }
+
+    #[tokio::test]
+    async fn two_devices_converge_through_a_bucket() {
+        let store = MemStore::new();
+        let bucket = ObjectSync::new(std::sync::Arc::clone(&store), "submarine/sync");
+        let (a, ha) = device("A");
+        let (b, hb) = device("B");
+        a.execute("INSERT INTO ssh_keys(name, public_key, private_key) VALUES('k','pub','priv')", []).unwrap();
+        a.execute("INSERT INTO credentials(name, auth_type, username, key_id) VALUES('c','key','root',(SELECT id FROM ssh_keys WHERE name='k'))", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port, credential_id) VALUES('web','h1',22,(SELECT id FROM credentials WHERE name='c'))", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port) VALUES('db','h9',22)", []).unwrap();
+        bucket_sync(&a, &ha, &bucket).await;
+        bucket_sync(&b, &hb, &bucket).await;
+        assert_eq!(host_of(&b, "web").as_deref(), Some("h1"));
+        assert_eq!(linked_credential_named(&b, "web").as_deref(), Some("c"), "links resolve across devices");
+
+        // B edits one server and deletes the other; A picks both up.
+        b.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        b.execute("DELETE FROM servers WHERE name='db'", []).unwrap();
+        bucket_sync(&b, &hb, &bucket).await;
+        bucket_sync(&a, &ha, &bucket).await;
+        assert_eq!(host_of(&a, "web").as_deref(), Some("h2"));
+        assert_eq!(host_of(&a, "db"), None, "the delete propagates");
+
+        // Settled: another round on each side moves nothing.
+        let quiet = |c: &Connection| collect_local_records(c, &KEY, "").unwrap();
+        let out_a = bucket.exchange("p1", &quiet(&a), None).await.unwrap();
+        let out_b = bucket.exchange("p1", &quiet(&b), None).await.unwrap();
+        assert_eq!((out_a.pushed, out_a.remote.len(), out_b.pushed, out_b.remote.len()), (0, 0, 0, 0));
+    }
+
+    fn linked_credential_named(c: &Connection, server: &str) -> Option<String> {
+        c.query_row(
+            "SELECT (SELECT name FROM credentials k WHERE k.id = s.credential_id) FROM servers s WHERE s.name=?1",
+            [server],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    // Both devices edit the same server offline. The newer edit wins on both,
+    // and the losing edit is still in the bucket (superseded, not destroyed).
+    #[tokio::test]
+    async fn concurrent_offline_edits_newest_wins_and_the_loser_is_kept() {
+        let store = MemStore::new();
+        let bucket = ObjectSync::new(std::sync::Arc::clone(&store), "submarine/sync");
+        let (a, ha) = device("A");
+        let (b, hb) = device("B");
+        a.execute("INSERT INTO servers(name, host, port) VALUES('web','h1',22)", []).unwrap();
+        bucket_sync(&a, &ha, &bucket).await;
+        bucket_sync(&b, &hb, &bucket).await;
+
+        a.execute("UPDATE servers SET host='from-a' WHERE name='web'", []).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        b.execute("UPDATE servers SET host='from-b' WHERE name='web'", []).unwrap();
+        // The OLDER edit syncs last — it must still lose.
+        bucket_sync(&b, &hb, &bucket).await;
+        bucket_sync(&a, &ha, &bucket).await;
+        bucket_sync(&b, &hb, &bucket).await;
+        assert_eq!(host_of(&a, "web").as_deref(), Some("from-b"));
+        assert_eq!(host_of(&b, "web").as_deref(), Some("from-b"));
+        let versions = store.keys().iter().filter(|k| k.contains("/r/servers/")).count();
+        assert_eq!(versions, 3, "original, loser and winner are all retained");
+
+        // Past retention, cleanup keeps only the winner.
+        store.age_all(31 * 24 * 3600);
+        bucket_sync(&a, &ha, &bucket).await;
+        let versions = store.keys().iter().filter(|k| k.contains("/r/servers/")).count();
+        assert_eq!(versions, 1);
+        assert_eq!(host_of(&a, "web").as_deref(), Some("from-b"));
+    }
+
+    // A device lists the bucket between another device's credential and server
+    // uploads landing (simulated: the credential object is missing at first).
+    // The link must be repaired by a later sync, not lost.
+    #[tokio::test]
+    async fn a_server_listed_before_its_credential_is_linked_later() {
+        let store = MemStore::new();
+        let bucket = ObjectSync::new(std::sync::Arc::clone(&store), "submarine/sync");
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO credentials(name, auth_type, username) VALUES('c','password','root')", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port, credential_id) VALUES('web','h1',22,(SELECT id FROM credentials WHERE name='c'))", []).unwrap();
+        bucket_sync(&a, &ha, &bucket).await;
+
+        let cred_key = store.keys().into_iter().find(|k| k.contains("/r/credentials/")).unwrap();
+        let held = store.objects.lock().unwrap().remove(&cred_key).unwrap();
+        let (b, hb) = device("B");
+        bucket_sync(&b, &hb, &bucket).await;
+        assert_eq!(linked_credential_named(&b, "web"), None, "precondition: the credential wasn't listed");
+
+        store.objects.lock().unwrap().insert(cred_key, held);
+        bucket_sync(&b, &hb, &bucket).await;
+        assert_eq!(linked_credential_named(&b, "web").as_deref(), Some("c"));
+    }
+
+    /// Settings for a real S3-compatible endpoint, or None to skip. Set
+    /// SUBMARINE_S3_IT=1 plus SUBMARINE_S3_IT_CFG (s3cmd config path),
+    /// SUBMARINE_S3_IT_BUCKET and optionally SUBMARINE_S3_IT_ENDPOINT.
+    pub(crate) fn it_settings() -> Option<sync_backend::S3Settings> {
+        if std::env::var("SUBMARINE_S3_IT").ok()? != "1" {
+            return None;
+        }
+        Some(sync_backend::S3Settings {
+            credentials_file: std::env::var("SUBMARINE_S3_IT_CFG").ok()?,
+            bucket: std::env::var("SUBMARINE_S3_IT_BUCKET").ok()?,
+            prefix: format!("submarine-it/{}", new_entity_uuid()),
+            endpoint: std::env::var("SUBMARINE_S3_IT_ENDPOINT").ok(),
+            region: std::env::var("SUBMARINE_S3_IT_REGION").ok(),
+            path_style: std::env::var("SUBMARINE_S3_IT_VHOST").ok().as_deref() != Some("1"),
+        })
+    }
+
+    #[tokio::test]
+    async fn it_two_devices_converge_through_a_real_s3_endpoint() {
+        let Some(settings) = it_settings() else { return };
+        let bucket = sync_backend::s3_transport(&settings).unwrap();
+        let (a, ha) = device("A");
+        let (b, hb) = device("B");
+        a.execute("INSERT INTO credentials(name, auth_type, username) VALUES('c','password','root')", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port, credential_id) VALUES('web','h1',22,(SELECT id FROM credentials WHERE name='c'))", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port) VALUES('db','h9',22)", []).unwrap();
+        bucket_sync(&a, &ha, bucket.as_ref()).await;
+        bucket_sync(&b, &hb, bucket.as_ref()).await;
+        assert_eq!(linked_credential_named(&b, "web").as_deref(), Some("c"));
+
+        b.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        b.execute("DELETE FROM servers WHERE name='db'", []).unwrap();
+        bucket_sync(&b, &hb, bucket.as_ref()).await;
+        bucket_sync(&a, &ha, bucket.as_ref()).await;
+        assert_eq!(host_of(&a, "web").as_deref(), Some("h2"));
+        assert_eq!(host_of(&a, "db"), None);
+
+        let profiles = bucket.list_profiles().await.unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!((profiles[0].profile.as_str(), profiles[0].name.as_str(), profiles[0].live_records), ("p1", "work", 2));
+        let stats = compute_sync_diff(&collect_local_records(&a, &KEY, "").unwrap(), &bucket.index("p1").await.unwrap(), &Default::default());
+        assert_eq!((stats.needs_push, stats.needs_pull), (0, 0));
+
+        assert!(bucket.delete_profile("p1").await.unwrap() >= 5);
+        assert!(bucket.list_profiles().await.unwrap().is_empty(), "test prefix must be left empty");
     }
 }
 

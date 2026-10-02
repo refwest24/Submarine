@@ -56,11 +56,44 @@ pub enum Backend {
     S3,
 }
 
+/// Where the S3 transport syncs to. No secrets: the keys stay in the s3cmd
+/// config file named here and are read only when a sync runs.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct S3Settings {
+    /// s3cmd-format config holding `access_key` / `secret_key`; `~/` allowed.
+    pub credentials_file: String,
+    pub bucket: String,
+    /// Key prefix inside the bucket, so one bucket can serve other purposes.
+    pub prefix: String,
+    /// Overrides the credentials file's `host_base`, e.g. `http://127.0.0.1:9000`.
+    pub endpoint: Option<String>,
+    /// Overrides the region derived from `bucket_location`.
+    pub region: Option<String>,
+    /// `https://host/bucket/key` (works on every S3-compatible service) rather
+    /// than `https://bucket.host/key`.
+    pub path_style: bool,
+}
+
+impl Default for S3Settings {
+    fn default() -> Self {
+        Self {
+            credentials_file: "~/.config/submarine-sync/s3cfg".into(),
+            bucket: String::new(),
+            prefix: "submarine/sync".into(),
+            endpoint: None,
+            region: None,
+            path_style: true,
+        }
+    }
+}
+
 /// Per-install sync settings. Holds no secrets.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct BackendConfig {
     pub backend: Backend,
+    pub s3: S3Settings,
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -89,10 +122,16 @@ pub fn personal_transport(
     app: &tauri::AppHandle,
     cloud: &Arc<CloudState>,
 ) -> Result<Box<dyn SyncTransport>, String> {
-    match load_config(app)?.backend {
+    let cfg = load_config(app)?;
+    match cfg.backend {
         Backend::Http => Ok(Box::new(HttpTransport { app: app.clone(), cloud: Arc::clone(cloud) })),
-        Backend::S3 => Err("[S3] NOT_CONFIGURED: S3 sync is not available in this build".into()),
+        Backend::S3 => s3_transport(&cfg.s3),
     }
+}
+
+pub fn s3_transport(settings: &S3Settings) -> Result<Box<dyn SyncTransport>, String> {
+    let store = crate::s3_store::S3Store::new(settings)?;
+    Ok(Box::new(crate::object_sync::ObjectSync::new(Arc::new(store), &settings.prefix)))
 }
 
 // ---------------------------------------------------------------------------
