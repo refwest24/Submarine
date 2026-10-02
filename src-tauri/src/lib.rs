@@ -566,6 +566,13 @@ fn create_sync_triggers(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("[SYNC] SYNC_META_TABLE: {e}"))?;
+    // Device-local: optional FK links whose referent hadn't arrived when the
+    // referrer was merged. See `retry_pending_fks`.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_fk_pending (tbl TEXT NOT NULL, uuid TEXT NOT NULL, fk_col TEXT NOT NULL, ref_table TEXT NOT NULL, ref_uuid TEXT NOT NULL, referrer_ua TEXT NOT NULL, PRIMARY KEY (tbl, uuid, fk_col))",
+        [],
+    )
+    .map_err(|e| format!("[SYNC] FK_PENDING_TABLE: {e}"))?;
     // Guard shared by the stamp/tombstone triggers: suppress them while merging.
     const GUARD: &str = "COALESCE((SELECT val FROM sync_flags WHERE key='merge'),0)=0";
     // The editor label stamped onto edited_by at mutation time (email when known,
@@ -923,13 +930,109 @@ fn apply_remote_inner(conn: &Connection, key: &[u8; 32], records: &[SyncRecord],
             rusqlite::params![id, f.uuid],
         ) {
             eprintln!("[SYNC] fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
+            continue;
+        }
+        if let Err(e) = note_pending_fk(&tx, &f, id.is_some()) {
+            eprintln!("[SYNC] fk pending skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
         }
     }
+    retry_pending_fks(&tx);
     tx.commit().map_err(|e| format!("[SYNC] TX_COMMIT: {e}"))?;
     if skipped > 0 {
         eprintln!("[SYNC] merge committed with {skipped} record(s) skipped");
     }
     Ok(())
+}
+
+/// Remember (or forget) an optional FK link left unresolved at the end of a
+/// batch. The HTTP server answers with one consistent snapshot, but an object
+/// store lists keys page by page, so a server can arrive one sync before the
+/// credential it points at. Without a memory of the intended link, the fixup
+/// writes NULL, the next sync skips the (equal-stamped) server, and the link is
+/// lost for good. A referent that is already tombstoned is never coming, so the
+/// NULL stands — exactly as before.
+fn note_pending_fk(conn: &Connection, f: &FkFixup, resolved: bool) -> Result<(), String> {
+    let gone: bool = conn
+        .query_row("SELECT 1 FROM sync_tombstones WHERE uuid=?1", [&f.ref_uuid], |_| Ok(()))
+        .is_ok();
+    let referrer_ua: Option<String> = conn
+        .query_row(&format!("SELECT updated_at FROM {} WHERE uuid=?1", f.table), [&f.uuid], |r| r.get(0))
+        .ok()
+        .flatten();
+    match referrer_ua {
+        Some(ua) if !resolved && !gone => conn.execute(
+            "INSERT INTO sync_fk_pending(tbl,uuid,fk_col,ref_table,ref_uuid,referrer_ua) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(tbl,uuid,fk_col) DO UPDATE SET ref_table=excluded.ref_table, ref_uuid=excluded.ref_uuid, referrer_ua=excluded.referrer_ua",
+            rusqlite::params![f.table, f.uuid, f.fk_col, f.ref_table, f.ref_uuid, ua],
+        ),
+        _ => conn.execute(
+            "DELETE FROM sync_fk_pending WHERE tbl=?1 AND uuid=?2 AND fk_col=?3",
+            rusqlite::params![f.table, f.uuid, f.fk_col],
+        ),
+    }
+    .map(|_| ())
+    .map_err(|e| format!("[SYNC] FK_PENDING: {e}"))
+}
+
+/// Repair remembered links whose referent has since arrived. A pending link is
+/// dropped once it resolves, once its referrer is gone or re-stamped (a newer
+/// edit — local or remote — now owns that column), or once the referent is
+/// tombstoned. Best-effort, like the rest of the merge: a bad row is dropped,
+/// never fatal. Runs with the merge guard on, so the repair keeps the
+/// referrer's stamp.
+fn retry_pending_fks(conn: &Connection) {
+    let pending: Vec<(String, String, String, String, String, String)> = match conn
+        .prepare("SELECT tbl, uuid, fk_col, ref_table, ref_uuid, referrer_ua FROM sync_fk_pending")
+        .and_then(|mut stmt| {
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+                .collect::<Result<Vec<_>, _>>();
+            rows
+        }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("[SYNC] fk pending read failed: {e}");
+            return;
+        }
+    };
+    for (tbl, uuid, fk_col, ref_table, ref_uuid, referrer_ua) in pending {
+        // Table/column names are interpolated below, so only accept a triple
+        // that names a real optional FK.
+        let known = ENTITIES.iter().any(|s| {
+            s.table == tbl && s.fks.iter().any(|fk| !fk.required && fk.col == fk_col && fk.ref_table == ref_table)
+        });
+        let keep = known && {
+            let current: Option<String> = conn
+                .query_row(&format!("SELECT updated_at FROM {tbl} WHERE uuid=?1"), [&uuid], |r| r.get(0))
+                .ok()
+                .flatten();
+            let gone = conn
+                .query_row("SELECT 1 FROM sync_tombstones WHERE uuid=?1", [&ref_uuid], |_| Ok(()))
+                .is_ok();
+            current.as_deref() == Some(referrer_ua.as_str()) && !gone
+        };
+        let id: Option<i64> = if keep {
+            conn.query_row(&format!("SELECT id FROM {ref_table} WHERE uuid=?1"), [&ref_uuid], |r| r.get(0))
+                .ok()
+        } else {
+            None
+        };
+        if keep && id.is_none() {
+            continue;
+        }
+        if let Some(id) = id {
+            if let Err(e) = conn.execute(
+                &format!("UPDATE {tbl} SET {fk_col}=?1 WHERE uuid=?2 AND updated_at=?3"),
+                rusqlite::params![id, uuid, referrer_ua],
+            ) {
+                eprintln!("[SYNC] fk pending repair failed {tbl}.{fk_col} uuid={uuid}: {e}");
+            }
+        }
+        let _ = conn.execute(
+            "DELETE FROM sync_fk_pending WHERE tbl=?1 AND uuid=?2 AND fk_col=?3",
+            rusqlite::params![tbl, uuid, fk_col],
+        );
+    }
 }
 
 fn apply_entity(conn: &Connection, key: &[u8; 32], spec: &EntitySpec, rec: &SyncRecord, fk_fixups: &mut Vec<FkFixup>) -> Result<(), String> {
@@ -1329,6 +1432,63 @@ struct ProfileSyncStats {
     diff: Option<SyncDiff>,
 }
 
+/// Newest (stamp, entity_type) per uuid. A uuid can legitimately appear twice —
+/// a row re-created after an older delete keeps its tombstone — and a plain
+/// collect kept whichever came LAST (the tombstone), so a fully synced profile
+/// showed a permanent "N to receive" that nudged users toward Force push.
+fn newest_by_uuid(records: &[SyncRecord]) -> std::collections::HashMap<&str, (&str, &str)> {
+    let mut map: std::collections::HashMap<&str, (&str, &str)> = std::collections::HashMap::new();
+    // The reserved escrow record is bookkeeping, not user data.
+    for r in records.iter().filter(|r| r.entity_type != ESCROW_ETYPE) {
+        let e = map.entry(r.uuid.as_str()).or_insert((r.updated_at.as_str(), r.entity_type.as_str()));
+        if r.updated_at.as_str() > e.0 {
+            *e = (r.updated_at.as_str(), r.entity_type.as_str());
+        }
+    }
+    map
+}
+
+/// Compare this device's records with the cloud's view, by newest stamp per
+/// uuid. `server_names` (uuid → name) lets the diff name out-of-sync servers.
+fn compute_sync_diff(
+    local: &[SyncRecord],
+    server: &[SyncRecord],
+    server_names: &std::collections::HashMap<String, String>,
+) -> SyncDiff {
+    let local_map = newest_by_uuid(local);
+    let server_map = newest_by_uuid(server);
+
+    let mut in_sync = 0usize;
+    let mut needs_push = 0usize;
+    let mut needs_pull = 0usize;
+    let mut out: Vec<String> = Vec::new();
+
+    let mut uuids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    uuids.extend(local_map.keys());
+    uuids.extend(server_map.keys());
+    for u in uuids {
+        let l = local_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
+        let s = server_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
+        let is_server = local_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false)
+            || server_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false);
+        if l == s {
+            in_sync += 1;
+        } else {
+            if l > s {
+                needs_push += 1;
+            } else {
+                needs_pull += 1;
+            }
+            if is_server && out.len() < 20 {
+                if let Some(name) = server_names.get(u) {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    SyncDiff { in_sync, needs_push, needs_pull, out_of_sync_nodes: out }
+}
+
 /// Read-only sync + activity snapshot for the Profile panel. The recent-edits
 /// list is local and instant; the cloud diff is a best-effort dry run (an empty
 /// push that mutates nothing, then a local comparison) and is omitted on any
@@ -1430,49 +1590,7 @@ async fn profile_sync_stats(
             cloud::sync_exchange(&app, &cloud, &cloud_profile, "", &[], None).await
         };
         match pulled {
-            Ok(server) => {
-                use std::collections::HashMap;
-                let local_map: HashMap<&str, (&str, &str)> = local
-                    .iter()
-                    .map(|r| (r.uuid.as_str(), (r.updated_at.as_str(), r.entity_type.as_str())))
-                    .collect();
-                let server_map: HashMap<&str, (&str, &str)> = server
-                    .iter()
-                    // The reserved escrow record is bookkeeping, not user data.
-                    .filter(|r| r.entity_type != ESCROW_ETYPE)
-                    .map(|r| (r.uuid.as_str(), (r.updated_at.as_str(), r.entity_type.as_str())))
-                    .collect();
-
-                let mut in_sync = 0usize;
-                let mut needs_push = 0usize;
-                let mut needs_pull = 0usize;
-                let mut out: Vec<String> = Vec::new();
-
-                let mut uuids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                uuids.extend(local_map.keys());
-                uuids.extend(server_map.keys());
-                for u in uuids {
-                    let l = local_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
-                    let s = server_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
-                    let is_server = local_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false)
-                        || server_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false);
-                    if l == s {
-                        in_sync += 1;
-                    } else {
-                        if l > s {
-                            needs_push += 1;
-                        } else {
-                            needs_pull += 1;
-                        }
-                        if is_server && out.len() < 20 {
-                            if let Some(name) = server_names.get(u) {
-                                out.push(name.clone());
-                            }
-                        }
-                    }
-                }
-                Some(SyncDiff { in_sync, needs_push, needs_pull, out_of_sync_nodes: out })
-            }
+            Ok(server) => Some(compute_sync_diff(&local, &server, &server_names)),
             Err(_) => None,
         }
     };
@@ -2734,6 +2852,120 @@ mod sync_engine_tests {
             1,
             "the corrupt record must be skipped, never inserted",
         );
+    }
+
+    /// Device A's server 's1' linked to credential 'c', split into the two
+    /// records an object store can deliver in separate syncs.
+    fn server_and_its_credential() -> (SyncRecord, SyncRecord) {
+        let (a, _ha) = device("A");
+        a.execute("INSERT INTO credentials(name, auth_type, username) VALUES('c','password','root')", []).unwrap();
+        a.execute(
+            "INSERT INTO servers(name, host, port, credential_id) VALUES('s1','h',22,(SELECT id FROM credentials WHERE name='c'))",
+            [],
+        )
+        .unwrap();
+        let recs = collect_local_records(&a, &KEY, "").unwrap();
+        let pick = |t: &str| recs.iter().find(|r| r.entity_type == t).unwrap().clone();
+        (pick("servers"), pick("credentials"))
+    }
+
+    fn linked_credential(c: &Connection) -> Option<String> {
+        c.query_row(
+            "SELECT (SELECT name FROM credentials k WHERE k.id = s.credential_id) FROM servers s WHERE s.name='s1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn pending_count(c: &Connection) -> i64 {
+        c.query_row("SELECT COUNT(*) FROM sync_fk_pending", [], |r| r.get(0)).unwrap()
+    }
+
+    // Object stores list page by page, so a server can arrive one sync before
+    // the credential it points at. The link must be repaired when the
+    // credential lands — not left NULL forever because the server's stamp
+    // no longer looks new.
+    #[test]
+    fn a_late_referent_repairs_the_link_on_a_later_sync() {
+        let (server, cred) = server_and_its_credential();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&server), &hb).unwrap();
+        assert_eq!(linked_credential(&b), None, "precondition: the referent hasn't arrived");
+        assert_eq!(pending_count(&b), 1, "the intended link must be remembered");
+
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&cred), &hb).unwrap();
+        assert_eq!(linked_credential(&b).as_deref(), Some("c"), "the link must be repaired");
+        assert_eq!(pending_count(&b), 0);
+        let ua: String = b.query_row("SELECT updated_at FROM servers WHERE name='s1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ua, server.updated_at, "the repair must not re-stamp the server (it would push as a new edit)");
+    }
+
+    // Once this device edits the server itself, that edit owns the column —
+    // a late referent must not overwrite it.
+    #[test]
+    fn a_pending_link_yields_to_a_local_edit() {
+        let (server, cred) = server_and_its_credential();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&server), &hb).unwrap();
+        b.execute("UPDATE servers SET host='h2' WHERE name='s1'", []).unwrap();
+
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&cred), &hb).unwrap();
+        assert_eq!(linked_credential(&b), None, "the local edit's NULL link stands");
+        assert_eq!(pending_count(&b), 0, "a stale pending link is dropped");
+    }
+
+    #[test]
+    fn a_pending_link_to_a_deleted_referent_is_dropped() {
+        let (server, cred) = server_and_its_credential();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&server), &hb).unwrap();
+        assert_eq!(pending_count(&b), 1);
+
+        let tomb = SyncRecord {
+            uuid: cred.uuid.clone(),
+            entity_type: "credentials".into(),
+            updated_at: format!("{}x", cred.updated_at),
+            deleted: true,
+            blob: None,
+        };
+        apply_remote_records(&b, &KEY, &[tomb, cred], &hb).unwrap();
+        assert_eq!(linked_credential(&b), None);
+        assert_eq!(pending_count(&b), 0, "a referent that's been deleted is never coming");
+    }
+
+    #[test]
+    fn no_pending_link_when_the_referent_is_already_deleted() {
+        let (server, cred) = server_and_its_credential();
+        let (b, hb) = device("B");
+        let tomb = SyncRecord {
+            uuid: cred.uuid,
+            entity_type: "credentials".into(),
+            updated_at: format!("{}x", cred.updated_at),
+            deleted: true,
+            blob: None,
+        };
+        apply_remote_records(&b, &KEY, &[tomb], &hb).unwrap();
+        apply_remote_records(&b, &KEY, &[server], &hb).unwrap();
+        assert_eq!(pending_count(&b), 0);
+    }
+
+    // A row re-created after an older delete keeps its tombstone, so the uuid
+    // appears twice locally. Stats must compare the NEWEST stamp, or a fully
+    // synced profile shows "1 to receive" forever.
+    #[test]
+    fn stats_compare_the_newest_stamp_per_uuid() {
+        let rec = |ua: &str, deleted: bool| SyncRecord {
+            uuid: "u1".into(),
+            entity_type: "servers".into(),
+            updated_at: ua.into(),
+            deleted,
+            blob: None,
+        };
+        let local = vec![rec("000000000000002:00000:A", false), rec("000000000000001:00000:A", true)];
+        let server = vec![rec("000000000000002:00000:A", false)];
+        let d = compute_sync_diff(&local, &server, &std::collections::HashMap::new());
+        assert_eq!((d.in_sync, d.needs_push, d.needs_pull), (1, 0, 0));
     }
 }
 
