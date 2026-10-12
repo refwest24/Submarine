@@ -72,7 +72,7 @@ Shared profiles stay on the HTTP cloud.
   - [x] 13.8 Tests: unit tests for the new name rule and the session-free S3 paths; `cargo test` (incl. live
         S3 ITs), typecheck, build; manual-test doc revised (names, sync without sign-in, picker ⋯ menu,
         proxy, self-hosted server coexistence, portable log location)
-  - [ ] 13.9 Fast-forward the fork's `main` to upstream (`refwest24/Submarine` only), push this branch;
+  - [x] 13.9 Fast-forward the fork's `main` to upstream (`refwest24/Submarine` only), push this branch;
         PR #1 shows only this branch's changes
   - [ ] 13.10 User re-runs the key manual checks on fresh test copies
 
