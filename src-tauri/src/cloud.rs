@@ -1,7 +1,12 @@
 //! Cloud sync client. Talks to the Submarine HTTP API for email-based
-//! account auth and encrypted-profile sync. The server never sees the
-//! per-profile encryption keys — we only ship the already-encrypted
-//! `.submarine` blobs (the same files `export_profile` produces locally).
+//! account auth, record-level profile sync (`/sync`, `/shares/sync`) and
+//! sharing (identity keys, shares, invites). The server never sees plaintext
+//! or keys: every record goes up as a blob already encrypted with its
+//! profile's data key (DEK), and the server only merges records
+//! last-writer-wins by their HLC stamp.
+//!
+//! Personal profiles can sync through an S3-compatible bucket instead (see
+//! `sync_backend.rs`); sharing always goes through this module.
 //!
 //! The contract this module targets is documented in PHASE 2 PLAN. Keep
 //! request / response shapes here as the single source of truth for the
