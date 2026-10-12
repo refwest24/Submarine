@@ -50,6 +50,31 @@ Shared profiles stay on the HTTP cloud.
   - [x] 12.7 Verify: unit tests (redaction, rotation), 72+ Rust tests, typecheck/build, rebuild E2E copies,
         then the manual tests with the log open
 - [x] 11. Resume E2E (step 6 error paths onward) on the rebuilt copies, then cleanup (re-run from scratch 2026-10-12)
+- [ ] 13. Bring in upstream `SinaXhpm/Submarine` main (`75678e5`, 77 commits past v0.3.8) — same PR (#1 on the fork)
+  - [ ] 13.1 Merge upstream main into this branch (merge, no rebase/force push); resolve the 8 conflicts
+        (Cargo.toml/lock, lib.rs, tunnel.rs, CloudPanel, ProfilePanel, ProfileSelectPage, SettingsPanel)
+  - [ ] 13.2 Build fixes: `HttpTransport` carries upstream's `cloud::Session` (#121); `hmac` 0.13 (sha2 0.11);
+        keep `async-trait` as a direct dependency; take upstream's lock and let cargo add only edges
+  - [ ] 13.3 S3 without sign-in (decision 7, user 2026-10-12): personal profiles on S3 need no cloud session
+        and skip upstream's per-profile server link (`check_profile_server` / `link_profile_server`, the
+        "syncs elsewhere" warning, Move here); sync / restore / force push / stats / list / delete check the
+        S3 settings and use S3. Shared profiles and the HTTP backend keep upstream's behaviour
+  - [ ] 13.4 Picker on upstream's redesign: one row identity (`row.key`) for selection, the ⋯ menu and React
+        keys; exact-name local ↔ cloud linking; storage-aware cloud bar; log-file calls inside upstream's
+        error places; `cleanErr` strips `[S3]`
+  - [ ] 13.5 Names (decision 8, user 2026-10-12): refuse a new profile whose name matches an existing one in
+        ANY letter case, on every platform — create / import (incl. upstream's Android `import_profile_bytes`)
+        / restore / accept-invite, local and cloud names; replaces the 10-05 "allowed on Linux" rule
+  - [ ] 13.6 S3 client honours the Cloud panel's proxy choice (upstream turned on reqwest `system-proxy`)
+  - [ ] 13.7 Upstream's new `eprintln!`/`println!` lines through applog; `[SYNC] OTHER_SERVER` message
+        without its code; README sentences made untrue by upstream (sync server wording, telemetry FAQ,
+        portable log folder, s3cfg not carried by portable mode)
+  - [ ] 13.8 Tests: unit tests for the new name rule and the session-free S3 paths; `cargo test` (incl. live
+        S3 ITs), typecheck, build; manual-test doc revised (names, sync without sign-in, picker ⋯ menu,
+        proxy, self-hosted server coexistence, portable log location)
+  - [ ] 13.9 Fast-forward the fork's `main` to upstream (`refwest24/Submarine` only), push this branch;
+        PR #1 shows only this branch's changes
+  - [ ] 13.10 User re-runs the key manual checks on fresh test copies
 
 Decision (9.3, user 2026-10-05): names that differ only in case are allowed where the disk is case-sensitive
 (Linux) and refused, with an explanation, where the disk ignores case (macOS/Windows defaults) — detected by
