@@ -16,16 +16,16 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, oneshot, Mutex, Semaphore};
+use tokio::sync::{broadcast, oneshot, Mutex, Notify, Semaphore};
 
 use crate::ssh_manager::ClientHandler;
 
@@ -33,7 +33,9 @@ use crate::ssh_manager::ClientHandler;
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One forwarding rule: what a node saves in its `tunnels` column, and what a
+/// session keeps in its rule list (`SshState::session_tunnel_specs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelSpec {
     /// "D" (dynamic / SOCKS5), "L" (local forward), "R" (remote forward —
     /// not implemented yet; start_tunnel returns an error for this kind).
@@ -45,6 +47,82 @@ pub struct TunnelSpec {
     /// Remote target "host:port" — used by L only. Ignored by D.
     #[serde(default)]
     pub remote: String,
+    /// The name the user gave the forward, if any (see `clean_name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Stopped by the user: the rule is kept, but nothing starts it (not a
+    /// connect, a reconnect, the dedicated connection or a retry) until the
+    /// user starts it again. Rules saved before this existed have no such
+    /// field, and run.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stopped: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Two specs are the same forward when their kind, local side and target
+/// match. The name and the stopped flag describe a forward; they don't make
+/// it a different one.
+impl PartialEq for TunnelSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.local == other.local && self.remote == other.remote
+    }
+}
+
+impl Eq for TunnelSpec {}
+
+/// The longest name a forward keeps, in characters.
+const NAME_MAX_CHARS: usize = 64;
+
+/// A name as typed, the way it is kept: trimmed, at most `NAME_MAX_CHARS`
+/// characters, and none at all when nothing is left.
+pub fn clean_name(name: Option<&str>) -> Option<String> {
+    let name: String = name?.trim().chars().take(NAME_MAX_CHARS).collect();
+    let name = name.trim_end().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// A session's rules after `spec` was started: the rule for that forward is
+/// running again (and takes `spec`'s name, if it has one), or is added at the
+/// end when the forward is new.
+pub fn rule_started(rules: &mut Vec<TunnelSpec>, spec: &TunnelSpec) {
+    match rules.iter_mut().find(|rule| *rule == spec) {
+        Some(rule) => {
+            rule.stopped = false;
+            if spec.name.is_some() {
+                rule.name = spec.name.clone();
+            }
+        }
+        None => rules.push(TunnelSpec { stopped: false, ..spec.clone() }),
+    }
+}
+
+/// A session's rules after the user stopped `spec`: the rule stays, marked
+/// stopped. (Before #28 a stop removed the rule, and the node lost it.)
+pub fn rule_stopped(rules: &mut [TunnelSpec], spec: &TunnelSpec) {
+    for rule in rules.iter_mut().filter(|rule| *rule == spec) {
+        rule.stopped = true;
+    }
+}
+
+/// Removes the rule for `spec`. False when there was none.
+pub fn rule_removed(rules: &mut Vec<TunnelSpec>, spec: &TunnelSpec) -> bool {
+    let before = rules.len();
+    rules.retain(|rule| rule != spec);
+    rules.len() != before
+}
+
+/// Gives the rule for `spec` the name `name` (see `clean_name`). False when
+/// there is no such rule.
+pub fn rule_renamed(rules: &mut [TunnelSpec], spec: &TunnelSpec, name: Option<&str>) -> bool {
+    let mut found = false;
+    for rule in rules.iter_mut().filter(|rule| *rule == spec) {
+        rule.name = clean_name(name);
+        found = true;
+    }
+    found
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +144,10 @@ pub struct TunnelStatus {
     pub conns_active: u32,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// The rule this tunnel was started from, so the Ports panel can tell
+    /// which of a session's rules are running (`listen_addr` is the resolved
+    /// address, not what the rule says).
+    pub spec: TunnelSpec,
 }
 
 pub struct ActiveTunnel {
@@ -358,6 +440,7 @@ pub async fn start_tunnel(
         conns_active: 0,
         bytes_in: 0,
         bytes_out: 0,
+        spec: spec.clone(),
     };
     let status_arc = Arc::new(Mutex::new(status.clone()));
 
@@ -620,6 +703,166 @@ impl<'a, S: AsyncWrite + Unpin> AsyncWrite for ActivityTracked<'a, S> {
     }
 }
 
+/// Most SSH→local bytes ONE bridged connection may hold that its local peer
+/// hasn't read yet. See `DrainedChannelStream`.
+const MAX_UNFLUSHED_BYTES: usize = 64 * 1024 * 1024;
+
+/// `AsyncRead + AsyncWrite` over a russh channel whose READ side is drained by
+/// a dedicated task into an in-memory queue — the replacement for
+/// `Channel::into_stream()` at every tunnel bridge site.
+///
+/// Why: since russh 0.50 each channel has a small bounded queue, and the
+/// connection's single protocol task *awaits* room in it before it will
+/// process anything else. russh also refills the SSH window as soon as data
+/// ARRIVES (not when it is consumed), so there is no per-channel flow control
+/// to lean on. With a plain `ChannelStream`, a local client that stops reading
+/// (a paused browser download, a wedged app behind `-L` / `-D` / `-R`) makes
+/// the pump stop reading the channel → its queue fills → the protocol task
+/// blocks → EVERY terminal, SFTP op, keepalive and other tunnel on that SSH
+/// connection freezes. Here the channel is always drained, so one slow consumer
+/// can only ever hurt itself: once its backlog passes `MAX_UNFLUSHED_BYTES`
+/// that ONE forwarded connection is cut (see `pump_channel`) instead of
+/// freezing the session or growing without bound (the russh-0.40 behaviour).
+///
+/// Dropping the stream closes the channel (like `ChannelStream`) and stops the
+/// drain task, whose receiver drop makes russh discard any late data for this
+/// channel instead of waiting on it.
+pub(crate) struct DrainedChannelStream {
+    rx: tokio::sync::mpsc::UnboundedReceiver<russh::ChannelMsg>,
+    /// Partially-consumed `ChannelMsg::Data` and the read offset into it.
+    cur: Option<(russh::ChannelMsg, usize)>,
+    queued: Arc<AtomicUsize>,
+    overflowed: Arc<AtomicBool>,
+    /// Signalled by the drain task when it gives up on a stalled local peer.
+    overflow: Arc<Notify>,
+    tx: Pin<Box<dyn AsyncWrite + Send>>,
+    write_half: Option<russh::ChannelWriteHalf<russh::client::Msg>>,
+    drain: tokio::task::AbortHandle,
+}
+
+pub(crate) fn drained_stream(channel: russh::Channel<russh::client::Msg>) -> DrainedChannelStream {
+    drained_stream_with_cap(channel, MAX_UNFLUSHED_BYTES)
+}
+
+fn drained_stream_with_cap(channel: russh::Channel<russh::client::Msg>, cap: usize) -> DrainedChannelStream {
+    let (mut read_half, write_half) = channel.split();
+    let (msg_tx, rx) = tokio::sync::mpsc::unbounded_channel::<russh::ChannelMsg>();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let overflow = Arc::new(Notify::new());
+    let drain = {
+        let queued = Arc::clone(&queued);
+        let overflowed = Arc::clone(&overflowed);
+        let overflow = Arc::clone(&overflow);
+        tokio::spawn(async move {
+            while let Some(msg) = read_half.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { ref data } => {
+                        let n = data.len();
+                        if queued.fetch_add(n, Ordering::AcqRel) + n > cap {
+                            overflowed.store(true, Ordering::Release);
+                            overflow.notify_one();
+                            crate::applog::warn(
+                                "TUNNEL",
+                                format!(
+                                    "local peer stopped reading ({} KiB backlog) — closing this forwarded connection",
+                                    cap >> 10
+                                ),
+                            );
+                            break;
+                        }
+                        if msg_tx.send(msg).is_err() {
+                            break; // stream dropped
+                        }
+                    }
+                    russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                    // stderr-style extended data, window adjusts, exit status…:
+                    // nothing to forward on a TCP bridge. Consumed so it can't
+                    // occupy the channel queue.
+                    _ => {}
+                }
+            }
+            // `read_half` (the channel's receiver) drops here.
+        })
+        .abort_handle()
+    };
+    DrainedChannelStream {
+        rx,
+        cur: None,
+        queued,
+        overflowed,
+        overflow,
+        tx: Box::pin(write_half.make_writer()),
+        write_half: Some(write_half),
+        drain,
+    }
+}
+
+impl AsyncRead for DrainedChannelStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            if let Some((msg, idx)) = this.cur.take() {
+                if let russh::ChannelMsg::Data { data } = &msg {
+                    let avail = data.len().saturating_sub(idx);
+                    if avail > 0 {
+                        let n = buf.remaining().min(avail);
+                        buf.put_slice(&data[idx..idx + n]);
+                        this.queued.fetch_sub(n, Ordering::AcqRel);
+                        if n < avail {
+                            this.cur = Some((msg, idx + n));
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                // Empty / fully consumed chunk: fetch the next one. (Returning
+                // Ok with zero bytes here would read as EOF.)
+                continue;
+            }
+            match ready!(this.rx.poll_recv(cx)) {
+                Some(msg) => this.cur = Some((msg, 0)),
+                None if this.overflowed.load(Ordering::Acquire) => {
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "forwarded connection closed: local peer stopped reading",
+                    )));
+                }
+                None => return Poll::Ready(Ok(())), // channel EOF / close
+            }
+        }
+    }
+}
+
+impl AsyncWrite for DrainedChannelStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        self.get_mut().tx.as_mut().poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().tx.as_mut().poll_flush(cx)
+    }
+    /// Sends the channel EOF (half-close), exactly like `ChannelStream`.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().tx.as_mut().poll_shutdown(cx)
+    }
+}
+
+impl Drop for DrainedChannelStream {
+    fn drop(&mut self) {
+        self.drain.abort();
+        if let Some(write_half) = self.write_half.take() {
+            // Async close, best effort — same as russh's own ChannelStream drop.
+            // Guarded so a drop outside a runtime (app shutdown) can't panic.
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let _ = write_half.close().await;
+                });
+            }
+        }
+    }
+}
+
 /// Bidirectional copy that closes the connection after `IDLE_TIMEOUT` of no
 /// traffic in either direction, freeing its permit. Drop-in for the old bare
 /// `tokio::io::copy_bidirectional` at every bridge site — the only behavioural
@@ -664,6 +907,25 @@ where
                 }
             }
         }
+    }
+}
+
+/// `pump_bidirectional` for a bridge whose SSH side is a `DrainedChannelStream`
+/// — what every tunnel bridge uses. It additionally ends the moment the drain
+/// task gives up on a local peer that stopped reading (backlog past
+/// `MAX_UNFLUSHED_BYTES`). Without that the pump would sit blocked writing to
+/// the stalled peer until the idle watchdog fired, holding the backlog in
+/// memory while the server kept streaming into a channel nobody reads. Ending
+/// drops both ends here: the local socket closes and the channel is closed, so
+/// the server stops sending.
+async fn pump_channel<A>(local: &mut A, channel: &mut DrainedChannelStream)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+{
+    let overflow = Arc::clone(&channel.overflow);
+    tokio::select! {
+        _ = pump_bidirectional(local, channel) => {}
+        _ = overflow.notified() => {}
     }
 }
 
@@ -779,8 +1041,8 @@ async fn bridge_local_to_channel(
         &handle, &target_host, target_port as u32,
         &peer.ip().to_string(), peer.port() as u32,
     ).await.map_err(|e| format!("channel_open_direct_tcpip: {}", e))?;
-    let mut stream = channel.into_stream();
-    let _ = pump_bidirectional(&mut sock, &mut stream).await;
+    let mut stream = drained_stream(channel);
+    pump_channel(&mut sock, &mut stream).await;
     Ok(())
 }
 
@@ -903,14 +1165,14 @@ async fn run_remote_forward(
 
     // Ask the server to start listening.
     let request = {
-        let mut h = handle.lock().await;
+        let h = handle.lock().await;
         h.tcpip_forward(&bind_addr, server_port).await
     };
     match request {
-        Ok(true) => {
+        Ok(_) => {
             set_state(&app, &status, "listening", None).await;
         }
-        Ok(false) => {
+        Err(russh::Error::RequestDenied) => {
             forwarded_targets.lock().await.remove(&server_port);
             return Err(format!(
                 "Server refused tcpip-forward on {}:{} — check sshd_config's `AllowTcpForwarding` / `GatewayPorts`",
@@ -936,12 +1198,26 @@ async fn run_remote_forward(
     Ok(())
 }
 
+/// How long an inbound `forwarded-tcpip` open may wait on the LOCAL connect
+/// before we refuse it. The server holds the outside client's connection open
+/// until we answer, so an unreachable local target must not leave it hanging.
+const FORWARDED_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Helper used by `ClientHandler::server_channel_open_forwarded_tcpip` to
 /// bridge an inbound forwarded channel to a local TCP socket. Lives in this
 /// module so the forwarding/bookkeeping code stays in one place.
+///
+/// Answers the server's channel open (russh >= 0.62 hands us `reply`): the
+/// local target is dialled FIRST and the channel is accepted only once that
+/// succeeds; otherwise (error or `FORWARDED_CONNECT_TIMEOUT`) it is rejected
+/// with `ConnectFailed`, so the outside connector sees a refusal rather than
+/// an accepted-then-dropped connection. A channel only goes live (and only
+/// needs draining) after `accept()`; from then on it's read through
+/// `drained_stream` like every other bridge.
 pub async fn bridge_forwarded_channel(
     entry: ForwardEntry,
-    mut stream: russh::ChannelStream<russh::client::Msg>,
+    channel: russh::Channel<russh::client::Msg>,
+    reply: russh::client::ChannelOpenHandle,
 ) {
     // Bump conns_total and push an update so the UI reflects the activity.
     {
@@ -950,15 +1226,33 @@ pub async fn bridge_forwarded_channel(
     }
     emit_update(&entry.app, &entry.status.lock().await.clone()).await;
 
-    match tokio::net::TcpStream::connect(&entry.target).await {
-        Ok(mut local) => {
+    let connect = tokio::time::timeout(
+        FORWARDED_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(&entry.target),
+    )
+    .await;
+    match connect {
+        Ok(Ok(mut local)) => {
             apply_tunnel_sockopts(&local);
-            let _ = pump_bidirectional(&mut local, &mut stream).await;
+            reply.accept().await;
+            let mut stream = drained_stream(channel);
+            pump_channel(&mut local, &mut stream).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             crate::applog::warn("TUNNEL", format!("remote-forward connect to {} failed: {}", entry.target, e));
-            // Dropping the channel stream closes it; the server reports EOF
-            // back to the outside connector.
+            drop(channel);
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+        }
+        Err(_) => {
+            crate::applog::warn(
+                "TUNNEL",
+                format!(
+                    "remote-forward connect to {} timed out after {:?}",
+                    entry.target, FORWARDED_CONNECT_TIMEOUT
+                ),
+            );
+            drop(channel);
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
         }
     }
 }
@@ -1205,8 +1499,8 @@ async fn handle_http_proxy(
             }
         };
 
-        let mut stream = channel.into_stream();
-        let _ = pump_bidirectional(&mut sock, &mut stream).await;
+        let mut stream = drained_stream(channel);
+        pump_channel(&mut sock, &mut stream).await;
         emit_log(&app, &session_id, &tunnel_id, "info", "close",
                  Some(target_full), Some(peer.to_string()), None);
         return Ok(());
@@ -1244,7 +1538,7 @@ async fn handle_http_proxy(
         &peer.ip().to_string(), peer.port() as u32,
     ).await;
     let mut stream = match channel {
-        Ok(c) => c.into_stream(),
+        Ok(c) => drained_stream(c),
         Err(e) => {
             let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n").await;
             emit_log(&app, &session_id, &tunnel_id, "error", "fail",
@@ -1270,7 +1564,7 @@ async fn handle_http_proxy(
     // forwarded request makes the upstream close its half after one
     // response, which cascades to closing the client socket — exactly what
     // a non-pipelined HTTP proxy should do.
-    let _ = pump_bidirectional(&mut sock, &mut stream).await;
+    pump_channel(&mut sock, &mut stream).await;
     emit_log(&app, &session_id, &tunnel_id, "info", "close",
              Some(target_full), Some(peer.to_string()), None);
     Ok(())
@@ -1511,8 +1805,8 @@ async fn handle_socks4(
         }
     };
 
-    let mut stream = channel.into_stream();
-    let _ = pump_bidirectional(&mut sock, &mut stream).await;
+    let mut stream = drained_stream(channel);
+    pump_channel(&mut sock, &mut stream).await;
     emit_log(&app, &session_id, &tunnel_id, "info", "close",
              Some(target_full), Some(peer.to_string()), None);
     Ok(())
@@ -1644,8 +1938,8 @@ async fn handle_socks5(
         }
     };
 
-    let mut stream = channel.into_stream();
-    let _ = pump_bidirectional(&mut sock, &mut stream).await;
+    let mut stream = drained_stream(channel);
+    pump_channel(&mut sock, &mut stream).await;
     emit_log(&app, &session_id, &tunnel_id, "info", "close",
              Some(target_full), Some(peer.to_string()), None);
     Ok(())
@@ -1653,9 +1947,226 @@ async fn handle_socks5(
 
 #[cfg(test)]
 mod tunnel_tests {
-    use super::{bind_with_retry, pump_bidirectional_with_idle};
+    use super::{bind_with_retry, drained_stream, drained_stream_with_cap, pump_bidirectional_with_idle, pump_channel};
+    use super::{clean_name, rule_removed, rule_renamed, rule_started, rule_stopped, TunnelSpec};
+    use crate::ssh_test_server::{connect, TestServer};
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn spec(kind: &str, local: &str, remote: &str) -> TunnelSpec {
+        serde_json::from_value(serde_json::json!({ "type": kind, "local": local, "remote": remote })).unwrap()
+    }
+
+    #[test]
+    fn rules_saved_before_names_and_stopping_read_and_save_as_they_were() {
+        let old = r#"[{"type":"L","local":"8080","remote":"db:5432"},{"type":"D","local":"1080","remote":""}]"#;
+        let rules: Vec<TunnelSpec> = serde_json::from_str(old).unwrap();
+        assert!(rules.iter().all(|rule| rule.name.is_none() && !rule.stopped));
+        // Unchanged rules are saved byte for byte as before, so an older
+        // version reading them sees nothing new.
+        assert_eq!(serde_json::to_string(&rules).unwrap(), old);
+        // The node form keeps a row id of its own in the same objects.
+        let with_row_id: TunnelSpec =
+            serde_json::from_str(r#"{"rid":"t-1","type":"L","local":"8080","remote":"db:5432"}"#).unwrap();
+        assert_eq!(with_row_id, rules[0]);
+    }
+
+    #[test]
+    fn a_name_and_a_stop_are_saved_with_the_rule() {
+        let mut rule = spec("L", "8080", "db:5432");
+        rule.name = Some("database".into());
+        rule.stopped = true;
+        let json = serde_json::to_string(&rule).unwrap();
+        assert_eq!(json, r#"{"type":"L","local":"8080","remote":"db:5432","name":"database","stopped":true}"#);
+        let back: TunnelSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name.as_deref(), Some("database"));
+        assert!(back.stopped);
+    }
+
+    #[test]
+    fn a_forward_is_the_same_one_whatever_its_name_or_state() {
+        let mut named = spec("L", "8080", "db:5432");
+        named.name = Some("database".into());
+        named.stopped = true;
+        assert_eq!(named, spec("L", "8080", "db:5432"));
+        assert_ne!(spec("L", "8080", "db:5432"), spec("L", "8081", "db:5432"));
+        assert_ne!(spec("L", "8080", "db:5432"), spec("L", "8080", "db:5433"));
+        assert_ne!(spec("L", "8080", "x:1"), spec("R", "8080", "x:1"));
+    }
+
+    #[test]
+    fn a_name_is_kept_trimmed_and_short_and_none_when_blank() {
+        assert_eq!(clean_name(Some("  web admin  ")).as_deref(), Some("web admin"));
+        assert_eq!(clean_name(Some("   ")), None);
+        assert_eq!(clean_name(Some("")), None);
+        assert_eq!(clean_name(None), None);
+        let long = "ü".repeat(100);
+        assert_eq!(clean_name(Some(&long)).unwrap().chars().count(), 64);
+        // Cutting at 64 can leave a space at the end; it goes too.
+        let spaced = format!("{} tail", "a".repeat(63));
+        assert_eq!(clean_name(Some(&spaced)).unwrap(), "a".repeat(63));
+    }
+
+    #[test]
+    fn stopping_keeps_the_rule_and_starting_brings_it_back() {
+        let mut rules = vec![spec("D", "1080", ""), spec("L", "8080", "db:5432")];
+        rules[1].name = Some("database".into());
+
+        rule_stopped(&mut rules, &spec("L", "8080", "db:5432"));
+        assert_eq!(rules.len(), 2, "a stop keeps the rule");
+        assert!(rules[1].stopped && !rules[0].stopped);
+        assert_eq!(rules[1].name.as_deref(), Some("database"));
+
+        // Started again without a name: the rule keeps the one it has.
+        rule_started(&mut rules, &spec("L", "8080", "db:5432"));
+        assert_eq!(rules.len(), 2, "no duplicate");
+        assert!(!rules[1].stopped);
+        assert_eq!(rules[1].name.as_deref(), Some("database"));
+
+        // A new forward is added at the end, running, with its name.
+        let mut new = spec("R", "9000", "localhost:22");
+        new.name = Some("back in".into());
+        new.stopped = true; // whatever the caller sent, a started rule runs
+        rule_started(&mut rules, &new);
+        assert_eq!(rules.len(), 3);
+        assert!(!rules[2].stopped);
+        assert_eq!(rules[2].name.as_deref(), Some("back in"));
+    }
+
+    #[test]
+    fn removing_and_renaming_touch_only_that_rule() {
+        let mut rules = vec![spec("D", "1080", ""), spec("L", "8080", "db:5432")];
+        assert!(rule_renamed(&mut rules, &spec("D", "1080", ""), Some(" socks ")));
+        assert_eq!(rules[0].name.as_deref(), Some("socks"));
+        assert!(rule_renamed(&mut rules, &spec("D", "1080", ""), Some("")));
+        assert_eq!(rules[0].name, None, "an empty name takes the name away");
+        assert!(!rule_renamed(&mut rules, &spec("D", "1081", ""), Some("x")), "no such rule");
+
+        assert!(rule_removed(&mut rules, &spec("L", "8080", "db:5432")));
+        assert_eq!(rules, vec![spec("D", "1080", "")]);
+        assert!(!rule_removed(&mut rules, &spec("L", "8080", "db:5432")), "already gone");
+    }
+
+    /// Round-trip a few bytes on a NEW channel of `session` — only possible
+    /// while russh's protocol task for the connection is not blocked.
+    async fn echo_round_trip(session: &russh::client::Handle<crate::ssh_test_server::TestClient>) {
+        let channel = session.channel_open_session().await.unwrap();
+        channel.exec(false, "echo").await.unwrap();
+        let mut echo = drained_stream(channel);
+        echo.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        echo.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    // B2: with a plain `ChannelStream`, a bridge whose local peer stops reading
+    // stops reading its channel; the channel's bounded queue fills and russh's
+    // protocol task blocks on it, freezing EVERY channel of the connection. A
+    // drained stream keeps accepting the data, so the rest of the connection
+    // stays usable — and the stalled peer still gets every byte once it resumes.
+    #[tokio::test]
+    async fn drained_stream_keeps_the_connection_usable_while_a_local_peer_stalls() {
+        const DOWNLOAD: usize = 16 * 1024 * 1024; // far more than a channel queue holds
+        let session = connect(TestServer::default(), |_| {}, crate::build_ssh_client_config())
+            .await
+            .expect("in-process SSH connection");
+        let download = session.channel_open_session().await.unwrap();
+        download.exec(false, format!("flood {}", DOWNLOAD)).await.unwrap();
+        // Nobody reads it for now — the paused local client.
+        let mut download = drained_stream(download);
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while download.queued.load(Ordering::SeqCst) < DOWNLOAD {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the whole download must be drained off the connection");
+        tokio::time::timeout(Duration::from_secs(10), echo_round_trip(&session))
+            .await
+            .expect("other channels must keep working while one local peer stalls");
+
+        // The peer resumes: every byte, then EOF.
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), download.read_to_end(&mut got))
+            .await
+            .expect("download completes")
+            .unwrap();
+        assert_eq!(got.len(), DOWNLOAD);
+    }
+
+    // Past the backlog cap the stalled bridge is cut at once — rather than
+    // holding the backlog until the idle watchdog fires while the server keeps
+    // sending — and only that bridge: the connection stays healthy.
+    #[tokio::test]
+    async fn a_local_peer_stalled_past_the_cap_cuts_only_its_own_bridge() {
+        let session = connect(TestServer::default(), |_| {}, crate::build_ssh_client_config())
+            .await
+            .expect("in-process SSH connection");
+        let channel = session.channel_open_session().await.unwrap();
+        channel.exec(false, "flood 67108864").await.unwrap();
+        let mut stream = drained_stream_with_cap(channel, 1024 * 1024);
+        // The local side of the bridge: a peer that never reads.
+        let (_stalled_peer, mut local) = tokio::io::duplex(64 * 1024);
+        tokio::time::timeout(Duration::from_secs(30), pump_channel(&mut local, &mut stream))
+            .await
+            .expect("the bridge must be cut once the backlog passes the cap");
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(10), echo_round_trip(&session))
+            .await
+            .expect("the SSH connection itself must stay usable");
+    }
+
+    // ProxyJump: the target session's russh protocol task stops reading its
+    // transport (the bastion's direct-tcpip channel) while a write waits for
+    // the bastion's window. With a plain `ChannelStream` the target's output
+    // then fills that channel's queue, the bastion connection's protocol task
+    // blocks on it — and never delivers the window adjust the write waits
+    // for: the whole jumped session deadlocks (reproduced with this exact
+    // setup). The always-drained transport keeps it moving.
+    #[tokio::test]
+    async fn a_drained_proxyjump_transport_does_not_deadlock_on_upload_plus_output() {
+        let bastion_server = TestServer::default();
+        let target_received = std::sync::Arc::clone(&bastion_server.jump_target_received);
+        // Small bastion window: the target session's writes keep waiting on it.
+        let bastion = connect(bastion_server, |c| c.window_size = 64 * 1024, crate::build_ssh_client_config())
+            .await
+            .expect("bastion connection");
+        let hop = bastion
+            .channel_open_direct_tcpip("target", 22, "127.0.0.1", 0)
+            .await
+            .unwrap();
+        // Same transport lib.rs hands the target session for a ProxyJump hop.
+        let target = crate::ssh_test_server::client_over(
+            drained_stream(hop),
+            crate::build_ssh_client_config(),
+            crate::ssh_test_server::TestClient::default(),
+        )
+        .await
+        .expect("target session through the jump host");
+
+        // The target floods output (drained, like the terminal pump would) ...
+        let output = target.channel_open_session().await.unwrap();
+        output.exec(false, "flood 268435456").await.unwrap();
+        let mut output = drained_stream(output);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            while matches!(output.read(&mut buf).await, Ok(n) if n > 0) {}
+        });
+        // ... while we upload far more than the bastion's window.
+        const UPLOAD: usize = 4 * 1024 * 1024;
+        let upload = target.channel_open_session().await.unwrap();
+        tokio::spawn(async move { upload.data_bytes(vec![b'u'; UPLOAD]).await });
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while target_received.load(Ordering::SeqCst) < UPLOAD {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the upload must reach the target while its output keeps flowing (no deadlock)");
+    }
 
     // The reconnect fix: a bind that hits a transient AddrInUse (the previous
     // listener still releasing the port during a reconnect) must succeed once

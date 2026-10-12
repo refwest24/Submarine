@@ -6,7 +6,7 @@
 //! took presigned GET/PUT but rejected presigned bucket listings. Spec:
 //! <https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html>
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 /// SHA-256 of an empty body, the payload hash for GET/DELETE/LIST.

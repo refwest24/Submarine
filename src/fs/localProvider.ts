@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { FileEntry, ListResult, LocalFileProvider } from "./types";
+import { localParent } from "./localPath";
 
 // Local filesystem provider. All paths are OS-native (backslashes on Windows,
 // forward slashes elsewhere). Backed by the small set of `local_*` Tauri
@@ -11,6 +12,8 @@ type RawLocalEntry = {
   is_dir: boolean;
   size: number;
   modified?: number;
+  is_symlink?: boolean;
+  broken_link?: boolean;
 };
 
 const isWindowsLike = (p: string) => /^[a-zA-Z]:[\\/]/.test(p) || p.includes("\\");
@@ -59,16 +62,21 @@ export function createLocalProvider(): LocalFileProvider {
     },
 
     async list(path: string): Promise<ListResult> {
-      const raw = await invoke<RawLocalEntry[]>("local_list_dir", { path });
-      const entries: FileEntry[] = raw.map((r) => ({
+      // `current_path` is the folder as the backend resolved it (real letter
+      // case, one kind of separator, links followed), so the path bar shows
+      // where the pane really is, whatever was typed.
+      const raw = await invoke<{ current_path: string; entries: RawLocalEntry[] }>("local_list_dir", { path });
+      const entries: FileEntry[] = raw.entries.map((r) => ({
         name: r.name,
         path: r.path,
         isDir: r.is_dir,
         size: r.size,
         modified: r.modified,
+        isSymlink: !!r.is_symlink,
+        brokenLink: !!r.broken_link,
       }));
-      if (entries.length > 0) inferSep(entries[0].path);
-      return { currentPath: path, entries };
+      inferSep(raw.current_path);
+      return { currentPath: raw.current_path, entries };
     },
 
     joinPath(dir: string, name: string) {
@@ -77,15 +85,7 @@ export function createLocalProvider(): LocalFileProvider {
     },
 
     parentPath(path: string) {
-      const sep = inferSep(path);
-      const trimmed = path.replace(/[\\/]+$/, "");
-      const idx = trimmed.lastIndexOf(sep);
-      if (idx <= 0) return trimmed; // root or first segment
-      // Preserve drive root on Windows ("C:\")
-      if (sep === "\\" && idx === 2 && /^[a-zA-Z]:$/.test(trimmed.slice(0, 2))) {
-        return trimmed.slice(0, 3);
-      }
-      return trimmed.slice(0, idx);
+      return localParent(path);
     },
 
     async mkdir(path: string) {
@@ -93,11 +93,20 @@ export function createLocalProvider(): LocalFileProvider {
     },
 
     async remove(path: string, isDir: boolean) {
+      // The backend checks the on-disk type itself and only unlinks links.
       await invoke("local_remove", { path, isDir });
     },
 
     async rename(from: string, to: string) {
       await invoke("local_rename", { from, to });
+    },
+
+    async archive(dir, names, name, format, overwrite, jobId) {
+      return await invoke<string | null>("local_archive", { dir, names, name, format, overwrite, jobId });
+    },
+
+    async extract(dir, name, folder, jobId) {
+      return await invoke<string | null>("local_extract", { dir, name, folder, jobId });
     },
   };
 }

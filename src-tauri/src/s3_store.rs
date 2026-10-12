@@ -15,6 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
+use crate::cloud_config::ProxyConfig;
 use crate::object_sync::{ObjectInfo, ObjectStore};
 use crate::sigv4;
 use crate::sync_backend::S3Settings;
@@ -28,17 +29,13 @@ const SKEW_SECS: i64 = 300;
 const ATTEMPTS: u32 = 5;
 
 /// One client per store, i.e. per sync: its pooled connections live on the
-/// runtime that made them, so a process-wide client can outlive them. Redirects
-/// are off — an S3 redirect means "wrong endpoint/region", and a followed
-/// request would carry a signature for the wrong host anyway.
-fn new_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("submarine-app/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| format!("[S3] NETWORK: {e}"))
+/// runtime that made them, so a process-wide client can outlive them. Built
+/// like the sync server's (`cloud_config::build_client`): the proxy chosen in
+/// the Cloud panel, none for an endpoint on this machine, redirects off — an S3
+/// redirect means "wrong endpoint/region", and a followed request would carry a
+/// signature for the wrong host anyway.
+fn new_client(endpoint: &str, proxy: &ProxyConfig) -> Result<reqwest::Client, String> {
+    crate::cloud_config::build_client(endpoint, proxy, Duration::from_secs(60)).map_err(|e| format!("[S3] NETWORK: {e}"))
 }
 
 /// 250 ms, 500 ms, 1 s, 2 s … plus up to 100 ms of jitter so parallel
@@ -315,14 +312,14 @@ struct Reply {
 }
 
 impl S3Store {
-    pub fn new(settings: &S3Settings) -> Result<Self, String> {
+    pub fn new(settings: &S3Settings, proxy: &ProxyConfig) -> Result<Self, String> {
         if settings.bucket.trim().is_empty() {
             return Err("[S3] NOT_CONFIGURED: no bucket set".into());
         }
-        Self::with_config(settings, read_s3cmd_config(&settings.credentials_file)?)
+        Self::with_config(settings, read_s3cmd_config(&settings.credentials_file)?, proxy)
     }
 
-    fn with_config(settings: &S3Settings, cfg: S3cmdConfig) -> Result<Self, String> {
+    fn with_config(settings: &S3Settings, cfg: S3cmdConfig, proxy: &ProxyConfig) -> Result<Self, String> {
         let (endpoint, region) = endpoint_and_region(settings, &cfg)?;
         let url = url::Url::parse(&endpoint).map_err(|e| format!("[S3] NOT_CONFIGURED: bad endpoint {endpoint:?}: {e}"))?;
         let host = url.host_str().ok_or_else(|| format!("[S3] NOT_CONFIGURED: bad endpoint {endpoint:?}"))?;
@@ -330,7 +327,7 @@ impl S3Store {
             return Err(format!("[S3] NOT_CONFIGURED: endpoint {endpoint:?} must be http(s)"));
         }
         Ok(Self {
-            http: new_client()?,
+            http: new_client(&endpoint, proxy)?,
             scheme: url.scheme().to_string(),
             authority: url.port().map_or_else(|| host.to_string(), |p| format!("{host}:{p}")),
             bucket: settings.bucket.trim().to_string(),
@@ -557,9 +554,9 @@ mod tests {
     #[test]
     fn addresses_buckets_both_ways() {
         let cfg = || parse_s3cmd_config("[default]\naccess_key=a\nsecret_key=s\nhost_base=h.example:9000\nuse_https=False\n").unwrap();
-        let path = S3Store::with_config(&S3Settings { bucket: "bk".into(), ..Default::default() }, cfg()).unwrap();
+        let path = S3Store::with_config(&S3Settings { bucket: "bk".into(), ..Default::default() }, cfg(), &ProxyConfig::default()).unwrap();
         assert_eq!(path.url_for("p/r/x y.rec", &[("prefix", "a/b")]).unwrap().as_str(), "http://h.example:9000/bk/p/r/x%20y.rec?prefix=a%2Fb");
-        let vhost = S3Store::with_config(&S3Settings { bucket: "bk".into(), path_style: false, ..Default::default() }, cfg()).unwrap();
+        let vhost = S3Store::with_config(&S3Settings { bucket: "bk".into(), path_style: false, ..Default::default() }, cfg(), &ProxyConfig::default()).unwrap();
         assert_eq!(vhost.url_for("", &[]).unwrap().as_str(), "http://bk.h.example:9000/");
     }
 
@@ -567,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn it_store_operations_pagination_and_errors() {
         let Some(settings) = crate::sync_engine_tests::it_settings() else { return };
-        let store = std::sync::Arc::new(S3Store::new(&settings).unwrap());
+        let store = std::sync::Arc::new(S3Store::new(&settings, &ProxyConfig::default()).unwrap());
         let base = format!("{}/", settings.prefix);
 
         // More than one listing page (S3 returns at most 1000 keys per page).
@@ -597,12 +594,12 @@ mod tests {
         store.delete(&format!("{base}missing")).await.unwrap();
 
         let wrong_bucket = S3Settings { bucket: "submarine-it-no-such-bucket".into(), ..settings.clone() };
-        let err = S3Store::new(&wrong_bucket).unwrap().list(&base).await.unwrap_err();
+        let err = S3Store::new(&wrong_bucket, &ProxyConfig::default()).unwrap().list(&base).await.unwrap_err();
         assert!(err.starts_with("[S3] BUCKET_NOT_FOUND") || err.starts_with("[S3] ACCESS_DENIED"), "{err}");
 
         let mut wrong_secret = read_s3cmd_config(&settings.credentials_file).unwrap();
         wrong_secret.secret_key = Zeroizing::new("wrong-secret".into());
-        let err = S3Store::with_config(&settings, wrong_secret).unwrap().list(&base).await.unwrap_err();
+        let err = S3Store::with_config(&settings, wrong_secret, &ProxyConfig::default()).unwrap().list(&base).await.unwrap_err();
         assert!(err.starts_with("[S3] SIGNATURE_MISMATCH") || err.starts_with("[S3] ACCESS_DENIED"), "{err}");
 
         // Leave the prefix empty.

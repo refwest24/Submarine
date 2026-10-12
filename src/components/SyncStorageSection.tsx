@@ -2,11 +2,12 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, CheckCircle2, ChevronRight, Cloud, Database, Loader2, PlugZap } from "lucide-react";
 
-// Where PERSONAL profiles sync on this install: the Submarine Cloud account, or
-// the user's own S3-compatible bucket. Per-device, stored by the backend (not in
+// Where PERSONAL profiles sync on this install: the account on the sync server
+// (Submarine Cloud or a self-hosted one, chosen in the Cloud panel), or the
+// user's own S3-compatible bucket. Per-device, stored by the backend (not in
 // localStorage) because Rust does the syncing. The S3 keys never pass through
 // here — the backend reads them from an s3cmd config file when it syncs.
-// Shared profiles always use the cloud account, whatever is chosen here.
+// Shared profiles always use the sync server account, whatever is chosen here.
 
 type Backend = "http" | "s3";
 
@@ -71,7 +72,7 @@ export default function SyncStorageSection({ onChanged }: { onChanged?: () => vo
     setBusy("save"); setErr(null); setOk(null);
     try {
       adopt(await invoke<SyncBackendView>("sync_backend_set", { config: { backend, s3 } }));
-      setOk(backend === "s3" ? "Saved — personal profiles now sync through your bucket." : "Saved — personal profiles sync through Submarine Cloud.");
+      setOk(backend === "s3" ? "Saved — personal profiles now sync through your bucket." : "Saved — personal profiles sync through your sync server.");
       onChanged?.();
     } catch (e) { setErr(clean(e)); }
     finally { setBusy(null); }
@@ -90,10 +91,10 @@ export default function SyncStorageSection({ onChanged }: { onChanged?: () => vo
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-500">Profile sync storage</span>
         <div className="flex items-center gap-1">
-          <button onClick={() => { setBackend("http"); setOk(null); }} className={tab(backend === "http")}>
-            <Cloud size={12} /> Submarine Cloud
+          <button type="button" onClick={() => { setBackend("http"); setOk(null); }} className={tab(backend === "http")}>
+            <Cloud size={12} /> Sync server
           </button>
-          <button onClick={() => { setBackend("s3"); setOk(null); }} className={tab(backend === "s3")}>
+          <button type="button" onClick={() => { setBackend("s3"); setOk(null); }} className={tab(backend === "s3")}>
             <Database size={12} /> S3 bucket
           </button>
         </div>
@@ -101,14 +102,15 @@ export default function SyncStorageSection({ onChanged }: { onChanged?: () => vo
 
       {backend === "http" ? (
         <p className="text-[11.5px] text-zinc-500 leading-relaxed">
-          Personal profiles sync through your Submarine Cloud account.
+          Personal profiles sync through your account on the sync server: Submarine Cloud, or your own server
+          if you set one in the Cloud panel.
         </p>
       ) : (
         <>
           <p className="text-[11.5px] text-zinc-500 leading-relaxed">
             Personal profiles sync item by item through your own S3-compatible bucket (Linode, AWS, MinIO, R2, B2),
             still end-to-end encrypted. The access key stays in an s3cmd config file that Submarine reads when it
-            syncs and never copies. Sharing a profile still needs a Submarine Cloud account.
+            syncs and never copies. No account is needed; sharing a profile still needs a sync server account.
           </p>
           <label className="block space-y-1">
             <span className={fieldLabel}>Credentials file (s3cmd format)</span>

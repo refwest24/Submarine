@@ -42,6 +42,12 @@ pub trait SyncTransport: Send + Sync {
     async fn list_profiles(&self) -> Result<Vec<SyncProfileInfo>, String>;
     /// Remove the whole remote partition; returns how many records went.
     async fn delete_profile(&self, profile: &str) -> Result<i64, String>;
+    /// The sync server this transport talks to, for the profile ↔ server link
+    /// (`check_profile_server` in lib.rs). `None` for a bucket: it is chosen per
+    /// install, so a profile synced there isn't tied to any server.
+    fn server(&self) -> Option<&str> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,9 +251,9 @@ pub async fn sync_backend_set(app: tauri::AppHandle, config: BackendConfig) -> R
 /// delete one small probe object under the prefix. The `.probe-` name can
 /// never be taken for a profile partition.
 #[tauri::command]
-pub async fn s3_test_connection(settings: S3Settings) -> Result<String, String> {
+pub async fn s3_test_connection(app: tauri::AppHandle, settings: S3Settings) -> Result<String, String> {
     let target = format!("bucket '{}', folder '{}'", settings.bucket.trim(), settings.prefix.trim());
-    let result = test_connection(settings).await;
+    let result = test_connection(settings, &proxy(&app)).await;
     match &result {
         Ok(msg) => crate::applog::info("S3", format!("connection test OK: {msg}")),
         Err(e) => crate::applog::warn("S3", format!("connection test for {target} failed: {e}")),
@@ -255,10 +261,10 @@ pub async fn s3_test_connection(settings: S3Settings) -> Result<String, String> 
     result
 }
 
-async fn test_connection(settings: S3Settings) -> Result<String, String> {
+async fn test_connection(settings: S3Settings, proxy: &crate::cloud_config::ProxyConfig) -> Result<String, String> {
     use crate::object_sync::ObjectStore as _;
     let settings = validate_s3(&settings)?;
-    let store = crate::s3_store::S3Store::new(&settings)?;
+    let store = crate::s3_store::S3Store::new(&settings, proxy)?;
     let base = if settings.prefix.is_empty() { String::new() } else { format!("{}/", settings.prefix) };
     let probe = format!("{base}.probe-{}", crate::new_entity_uuid());
     store.put(&probe, b"submarine connection test".to_vec()).await?;
@@ -275,20 +281,36 @@ async fn test_connection(settings: S3Settings) -> Result<String, String> {
     ))
 }
 
-/// The transport personal-profile sync should use on this install.
+/// The transport personal-profile sync should use on this install. HTTP needs
+/// the caller's sign-in (taken once per command, so every call it makes goes to
+/// one server); S3 needs none.
 pub fn personal_transport(
     app: &tauri::AppHandle,
     cloud: &Arc<CloudState>,
+    session: Option<&cloud::Session>,
 ) -> Result<Box<dyn SyncTransport>, String> {
     let cfg = load_config(app)?;
     match cfg.backend {
-        Backend::Http => Ok(Box::new(HttpTransport { app: app.clone(), cloud: Arc::clone(cloud) })),
-        Backend::S3 => s3_transport(&cfg.s3),
+        Backend::Http => Ok(Box::new(HttpTransport {
+            app: app.clone(),
+            cloud: Arc::clone(cloud),
+            session: session.cloned().ok_or("[CLOUD] NOT_SIGNED_IN")?,
+        })),
+        Backend::S3 => s3_transport(&cfg.s3, &proxy(app)),
     }
 }
 
-pub fn s3_transport(settings: &S3Settings) -> Result<Box<dyn SyncTransport>, String> {
-    let store = crate::s3_store::S3Store::new(settings)?;
+/// The proxy chosen in the Cloud panel, for the bucket too. Unreadable
+/// settings mean the default (the system's), as for the sync server.
+fn proxy(app: &tauri::AppHandle) -> crate::cloud_config::ProxyConfig {
+    crate::cloud_config::load(app).0.proxy
+}
+
+pub fn s3_transport(
+    settings: &S3Settings,
+    proxy: &crate::cloud_config::ProxyConfig,
+) -> Result<Box<dyn SyncTransport>, String> {
+    let store = crate::s3_store::S3Store::new(settings, proxy)?;
     Ok(Box::new(crate::object_sync::ObjectSync::new(Arc::new(store), &settings.prefix)))
 }
 
@@ -299,23 +321,24 @@ pub fn s3_transport(settings: &S3Settings) -> Result<Box<dyn SyncTransport>, Str
 pub struct HttpTransport {
     app: tauri::AppHandle,
     cloud: Arc<CloudState>,
+    session: cloud::Session,
 }
 
 #[async_trait]
 impl SyncTransport for HttpTransport {
     async fn exchange(&self, profile: &str, push: &[SyncRecord], name: Option<&str>) -> Result<ExchangeOut, String> {
-        let remote = cloud::sync_exchange(&self.app, &self.cloud, profile, "", push, name).await?;
+        let remote = cloud::sync_exchange(&self.app, &self.cloud, &self.session, profile, "", push, name).await?;
         Ok(ExchangeOut { remote, pushed: push.len() })
     }
 
     // The server answers an empty push with its full view and changes nothing,
     // which is all the stats diff and the restore peek have ever used.
     async fn index(&self, profile: &str) -> Result<Vec<SyncRecord>, String> {
-        cloud::sync_exchange(&self.app, &self.cloud, profile, "", &[], None).await
+        cloud::sync_exchange(&self.app, &self.cloud, &self.session, profile, "", &[], None).await
     }
 
     async fn escrows(&self, profile: &str) -> Result<Vec<String>, String> {
-        let peek = cloud::sync_exchange(&self.app, &self.cloud, profile, "", &[], None).await?;
+        let peek = cloud::sync_exchange(&self.app, &self.cloud, &self.session, profile, "", &[], None).await?;
         Ok(peek
             .into_iter()
             .filter(|r| r.entity_type == crate::ESCROW_ETYPE && r.uuid == crate::ESCROW_UUID)
@@ -324,11 +347,15 @@ impl SyncTransport for HttpTransport {
     }
 
     async fn list_profiles(&self) -> Result<Vec<SyncProfileInfo>, String> {
-        cloud::list_sync_profiles(&self.app, &self.cloud).await
+        cloud::list_sync_profiles(&self.app, &self.cloud, &self.session).await
     }
 
     async fn delete_profile(&self, profile: &str) -> Result<i64, String> {
-        cloud::delete_sync_profile(&self.app, &self.cloud, profile).await
+        cloud::delete_sync_profile(&self.app, &self.cloud, &self.session, profile).await
+    }
+
+    fn server(&self) -> Option<&str> {
+        Some(self.session.base())
     }
 }
 
@@ -367,11 +394,27 @@ mod tests {
         assert_eq!((cfg.backend, cfg.s3.prefix.as_str(), cfg.s3.path_style), (Backend::S3, "submarine/sync", true));
     }
 
+    // A personal profile synced through a bucket needs no cloud sign-in and is
+    // tied to no sync server, so the profile ↔ server link is skipped for it
+    // (decision 2026-10-12). Fake keys; nothing is contacted.
+    #[test]
+    fn an_s3_transport_needs_no_sign_in_and_no_server() {
+        let dir = std::env::temp_dir().join(format!("submarine-s3cfg-{}", crate::new_entity_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s3cfg");
+        std::fs::write(&file, "[default]\naccess_key = TESTKEY\nsecret_key = test-only\nhost_base = 127.0.0.1:9000\nuse_https = False\n")
+            .unwrap();
+        let settings = S3Settings { credentials_file: file.to_string_lossy().into_owned(), ..s3("bk", "submarine/sync") };
+        let transport = s3_transport(&settings, &Default::default()).unwrap();
+        assert_eq!(transport.server(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     // Against a real endpoint; skipped unless SUBMARINE_S3_IT=1.
     #[tokio::test]
     async fn it_connection_test_round_trips_a_probe() {
         let Some(settings) = crate::sync_engine_tests::it_settings() else { return };
-        let msg = s3_test_connection(settings).await.unwrap();
+        let msg = test_connection(settings, &Default::default()).await.unwrap();
         assert!(msg.starts_with("Connected"), "{msg}");
     }
 }

@@ -1,57 +1,271 @@
-import { useState, useEffect, useRef, memo } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, memo } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import { TerminalSquare, Folder, Network, AlertTriangle, Check, X, ShieldAlert, KeyRound, Play, Library, Info, Container, Plus, SplitSquareHorizontal, Columns, Rows, RotateCw } from "lucide-react";
+import { TerminalSquare, Folder, FolderUp, Network, AlertTriangle, Check, X, ShieldAlert, KeyRound, Play, Library, Info, Container, Plus, SplitSquareHorizontal, Columns, Rows, RotateCw, Loader2, PanelRight, PanelLeft, PanelBottom, PanelTop, Maximize2, Minimize2, UploadCloud } from "lucide-react";
 import TerminalView from "./TerminalView";
-import SftpWorkspace from "./SftpWorkspace";
+import SftpWorkspace, { type SftpView } from "./SftpWorkspace";
 import TunnelsPanel from "./TunnelsPanel";
 import InfoPanel from "./InfoPanel";
 import { CmdsPanel } from "./CmdsPanel";
+import { RenameInput } from "../ui/renameInput";
 import { useIsCompact } from "../hooks/useViewport";
+import { fontFamilyCss, readFontFamily, readFontSize } from "../util/terminalFont";
+import { readShellSyncPairs, useShellSyncServer, type ShellSyncPair } from "../util/shellSync";
+import { readUseLocalShell } from "../util/terminalShell";
+import { useSlideOverFocus } from "../ui/slideOverFocus";
+
+// What the shell-config push commands answer (mirror.rs' ShellSync* types).
+type ShellSyncShells = { remote_shell: string; local_shell: string; shell_mismatch: boolean };
+type ShellSyncEntry = { local: string; remote: string; size: number; action: string; reason: string | null; crlf: boolean };
+type ShellSyncReport = { home: string; entries: ShellSyncEntry[]; total_bytes: number };
+type ShellSyncPushResult = { pushed: number; bytes: number; failed: { remote: string; error: string }[]; backup: string | null };
+
+// Where the tool panel (SFTP, Ports, Library, Info) sits around the terminal.
+// Remembered per device like the panel's size; compact windows ignore it and
+// show the tool full screen.
+type ToolDock = "right" | "left" | "bottom" | "top";
+const TOOL_DOCK_KEY = "submarine-tool-dock";
+const DOCK_OPTIONS: { id: ToolDock; label: string; Icon: typeof PanelRight }[] = [
+  { id: "right", label: "Right of the terminal", Icon: PanelRight },
+  { id: "left", label: "Left of the terminal", Icon: PanelLeft },
+  { id: "bottom", label: "Below the terminal", Icon: PanelBottom },
+  { id: "top", label: "Above the terminal", Icon: PanelTop },
+];
+// The panel is the last element in the DOM; reversing the flex direction
+// moves it without remounting the terminals.
+const DOCK_FLEX: Record<ToolDock, string> = {
+  right: "flex-row",
+  left: "flex-row-reverse",
+  bottom: "flex-col",
+  top: "flex-col-reverse",
+};
+// Above or below the terminal the panel has a height of its own; the
+// terminal always keeps at least MIN_TERMINAL_HEIGHT. Beside it, the same
+// with a width: in a narrow split tile a wide panel would otherwise take the
+// whole tile and leave the terminal 0 px wide (gone, but still typing).
+const MIN_TOOL_HEIGHT = 160;
+const MIN_TERMINAL_HEIGHT = 120;
+const MIN_TERMINAL_WIDTH = 200;
+// The panel can also take the terminal's place ("full screen"); remembered
+// with the dock.
+const TOOL_FULL_KEY = "submarine-tool-full";
+
+// Title-bar button of a tool panel: give the panel the terminal's room, or
+// bring the terminal back. The terminal keeps running either way.
+const FullToggle = ({ full, onToggle }: { full: boolean; onToggle: () => void }) => (
+  <button
+    onClick={onToggle}
+    aria-pressed={full}
+    aria-label="Full screen"
+    title={full ? "Show the terminal again" : "Full screen: hide the terminal and give this panel all the room"}
+    className={`shrink-0 transition-colors ${full ? "text-primary hover:text-white" : "text-zinc-500 hover:text-white"}`}
+  >
+    {full ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+  </button>
+);
 
 // Compact "run this tab on its own dedicated SSH connection" toggle, shown in
 // the SFTP and Port-Forwarding tab headers. The status dot reflects the live
 // state of the dedicated connection: green = up, amber (pulsing) = opening /
 // applies-on-connect, red = couldn't be established (falling back to the main
 // session). No dot when the toggle is off.
-const SepToggle = ({ on, onToggle, status, title, onReconnect }: {
+//
+// The label is one word so it fits a narrow pane. Hovering it, or moving
+// keyboard focus to it, shows a short guide: what the option does (`hint`),
+// when the terminal's connection is used anyway, and what the dot's colours
+// mean.
+const SEP_GUIDE_WIDTH = 264;
+const SEP_GUIDE_HEIGHT = 136; // enough for the longest hint; only used to pick a side
+const SepToggle = ({ on, onToggle, status, hint, onReconnect }: {
   on: boolean;
   onToggle: (v: boolean) => void;
   status: 'ready' | 'pending' | 'failed' | 'off';
-  title: string;
+  hint: string;
   onReconnect?: () => void;
-}) => (
-  <span className="flex items-center gap-1.5">
-    <label className="flex items-center gap-1.5 text-[10px] text-zinc-400 hover:text-zinc-200 cursor-pointer select-none" title={title}>
-      <input type="checkbox" className="w-3 h-3 accent-primary" checked={on} onChange={(e) => onToggle(e.target.checked)} />
-      <span className="uppercase tracking-wider font-bold">Dedicated session</span>
-      {on && (
-        <span
-          className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-            status === 'ready' ? 'bg-emerald-400' : status === 'failed' ? 'bg-red-400' : 'bg-amber-400 animate-pulse'
-          }`}
-        />
-      )}
-    </label>
-    {/* Reconnect just the dedicated connection — outside the <label> so a
-        click can't toggle the checkbox. Shown whenever the toggle is on and
-        no connect attempt is already in flight; also the retry affordance
-        after a red (failed) dot. */}
-    {on && onReconnect && status !== 'pending' && (
-      <button
-        onClick={onReconnect}
-        title="Reconnect the dedicated session"
-        className="p-0.5 rounded text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
+}) => {
+  // The label's box while its guide shows; null while it is hidden.
+  const [guideAt, setGuideAt] = useState<{ left: number; top: number; bottom: number } | null>(null);
+  const showGuide = (label: HTMLElement) => {
+    const r = label.getBoundingClientRect();
+    setGuideAt({ left: r.left, top: r.top, bottom: r.bottom });
+  };
+  return (
+    <span className="flex items-center gap-1.5">
+      <label
+        className="flex items-center gap-1.5 text-[10px] text-zinc-400 hover:text-zinc-200 cursor-pointer select-none"
+        // Touch screens fake a hover on tap, which would leave the guide up
+        // after every toggle, so only a real pointer opens it.
+        onMouseEnter={(e) => { if (window.matchMedia('(hover: hover)').matches) showGuide(e.currentTarget); }}
+        onMouseLeave={() => setGuideAt(null)}
+        // Keyboard focus only: a mouse click focuses the checkbox too, and
+        // the guide would then outlive the pointer leaving.
+        onFocus={(e) => { if (e.target.matches(':focus-visible')) showGuide(e.currentTarget); }}
+        onBlur={() => setGuideAt(null)}
       >
-        <RotateCw size={10} />
-      </button>
-    )}
-  </span>
-);
+        <input type="checkbox" className="w-3 h-3 accent-primary" checked={on} aria-label="Dedicated session" onChange={(e) => onToggle(e.target.checked)} />
+        <span className="uppercase tracking-wider font-bold">Dedicated</span>
+        {on && (
+          <span
+            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+              status === 'ready' ? 'bg-emerald-400' : status === 'failed' ? 'bg-red-400' : 'bg-amber-400 animate-pulse'
+            }`}
+          />
+        )}
+      </label>
+      {/* Through a portal: the pane's title bar clips what overflows it.
+          Below the label, or above it when there is no room below. */}
+      {guideAt && createPortal(
+        <div
+          role="tooltip"
+          style={{
+            width: SEP_GUIDE_WIDTH,
+            left: Math.max(8, Math.min(guideAt.left, window.innerWidth - SEP_GUIDE_WIDTH - 8)),
+            ...(guideAt.bottom + 6 + SEP_GUIDE_HEIGHT <= window.innerHeight
+              ? { top: guideAt.bottom + 6 }
+              : { bottom: window.innerHeight - guideAt.top + 6 }),
+          }}
+          className="fixed z-[9999] pointer-events-none bg-[#15151a] border border-white/10 rounded-lg shadow-2xl px-3 py-2 text-[11px] leading-snug text-zinc-300"
+        >
+          <div className="mb-1 text-[10px] font-bold uppercase tracking-wider text-zinc-100">Dedicated session</div>
+          <p>{hint}</p>
+          <p className="mt-1 text-zinc-400">When it is off, or that connection can't be opened, the terminal's connection is used.</p>
+          <p className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-zinc-400">
+            <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />connected</span>
+            <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-amber-400" />connecting</span>
+            <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-red-400" />failed</span>
+          </p>
+        </div>,
+        document.body
+      )}
+      {/* Reconnect just the dedicated connection — outside the <label> so a
+          click can't toggle the checkbox. Shown whenever the toggle is on and
+          no connect attempt is already in flight; also the retry affordance
+          after a red (failed) dot. */}
+      {on && onReconnect && status !== 'pending' && (
+        <button
+          onClick={onReconnect}
+          title="Reconnect the dedicated session"
+          className="p-0.5 rounded text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
+        >
+          <RotateCw size={10} />
+        </button>
+      )}
+    </span>
+  );
+};
 
-const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange }: any) => {
+// The title bar of a tool panel with a Dedicated toggle (SFTP, Port
+// Forwarding): the title, the toggle, then the panel's buttons (SFTP's Mirror),
+// full screen and close. In a narrow panel not all of it fits. What gives way,
+// in this order: the title shortens ("SFTP", "Ports"), the title goes, and
+// only then does Mirror lose its word. So the word is there whenever there is
+// room for it. The bar measures itself instead of using fixed widths, because
+// the toggle is wider while its status dot shows and the text's width depends
+// on the font.
+const TITLE_BAR_GAP = 12; // gap-3 between the title, the toggle and the buttons
+const MIRROR_WORD_GAP = 6; // gap-1.5 between Mirror's icon and its word
+const TITLE_BAR_TEXT = "text-[10px] font-bold uppercase tracking-wider";
+interface TitleBarFit { title: "full" | "short" | "none"; mirrorWord: boolean }
+const TITLE_BAR_FITS: TitleBarFit[] = [
+  { title: "full", mirrorWord: true },
+  { title: "short", mirrorWord: true },
+  { title: "none", mirrorWord: true },
+  { title: "short", mirrorWord: false },
+  { title: "none", mirrorWord: false },
+];
+const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
+  title: string;
+  shortTitle: string;
+  toggle: React.ReactNode;
+  /** SFTP's Mirror button; the other panels have none. */
+  mirror?: { on: boolean; disabled: boolean; onToggle: () => void };
+  /** Buttons between Mirror and Close (full screen). */
+  extra: React.ReactNode;
+  onClose: () => void;
+}) => {
+  const barRef = useRef<HTMLDivElement | null>(null);
+  const toggleRef = useRef<HTMLSpanElement | null>(null);
+  const buttonsRef = useRef<HTMLDivElement | null>(null);
+  // Never shown: they only give the three texts' widths.
+  const fullTitleRef = useRef<HTMLSpanElement | null>(null);
+  const shortTitleRef = useRef<HTMLSpanElement | null>(null);
+  const mirrorWordRef = useRef<HTMLSpanElement | null>(null);
+  const [fitIndex, setFitIndex] = useState(0);
+  const fit = TITLE_BAR_FITS[fitIndex];
+  const fitRef = useRef(fit);
+  fitRef.current = fit;
+  useLayoutEffect(() => {
+    const bar = barRef.current, toggleBox = toggleRef.current, buttons = buttonsRef.current;
+    if (!bar || !toggleBox || !buttons || typeof ResizeObserver === "undefined") return;
+    const width = (el: HTMLElement | null) => (el ? el.getBoundingClientRect().width : 0);
+    const measure = () => {
+      const style = getComputedStyle(bar);
+      const room = bar.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      if (!(room > 0)) return; // not laid out
+      const word = mirrorWordRef.current ? width(mirrorWordRef.current) + MIRROR_WORD_GAP : 0;
+      const iconButtons = width(buttons) - (fitRef.current.mirrorWord ? word : 0);
+      const titles = { full: width(fullTitleRef.current), short: width(shortTitleRef.current), none: 0 };
+      const needed = (f: TitleBarFit) =>
+        (f.title === "none" ? 0 : titles[f.title] + TITLE_BAR_GAP)
+        + width(toggleBox) + TITLE_BAR_GAP + iconButtons + (f.mirrorWord ? word : 0);
+      // A pixel to spare, so rounding never leaves the last one a hair too wide.
+      const first = TITLE_BAR_FITS.findIndex((f) => needed(f) + 1 <= room);
+      setFitIndex(first === -1 ? TITLE_BAR_FITS.length - 1 : first);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(bar);
+    observer.observe(toggleBox);
+    observer.observe(buttons);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+  return (
+    <div ref={barRef} className="relative h-10 px-4 flex items-center gap-3 border-b border-white/5 bg-white/5 overflow-hidden">
+      {fit.title !== "none" && (
+        <span className={`${TITLE_BAR_TEXT} text-zinc-400 truncate min-w-0`}>
+          {fit.title === "full" ? title : shortTitle}
+        </span>
+      )}
+      <span ref={toggleRef} className="shrink-0 whitespace-nowrap">{toggle}</span>
+      <div ref={buttonsRef} className="ml-auto flex items-center gap-2 shrink-0">
+        {mirror && (
+          <button
+            onClick={mirror.onToggle}
+            disabled={mirror.disabled}
+            aria-pressed={mirror.on}
+            aria-label="Mirror"
+            title={mirror.disabled
+              ? "Mirror needs a saved server"
+              : mirror.on ? "Back to the files" : "Mirror: keep a local folder copied to this server"}
+            className={`h-6 px-2 rounded border flex items-center gap-1.5 ${TITLE_BAR_TEXT} transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
+              mirror.on
+                ? 'text-primary bg-primary/10 border-primary/30'
+                : 'text-zinc-400 border-white/10 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <FolderUp size={12} className="shrink-0" />
+            {fit.mirrorWord && <span>Mirror</span>}
+          </button>
+        )}
+        {extra}
+        <button onClick={onClose} aria-label="Close" className="text-zinc-500 hover:text-white transition-colors shrink-0">
+          <X size={14} />
+        </button>
+      </div>
+      <div aria-hidden className="absolute left-0 top-0 invisible pointer-events-none whitespace-nowrap flex gap-4">
+        <span ref={fullTitleRef} className={TITLE_BAR_TEXT}>{title}</span>
+        <span ref={shortTitleRef} className={TITLE_BAR_TEXT}>{shortTitle}</span>
+        {mirror && <span ref={mirrorWordRef} className={TITLE_BAR_TEXT}>Mirror</span>}
+      </div>
+    </div>
+  );
+};
+
+// `displayName`: the session tab's name, which the user may have changed
+// from the server's (DesktopApp's tabNames). `profile`: the unlocked
+// profile's name, for what is kept per server on this device.
+const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, onPromptChange }: any) => {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting');
 
   // Bubble every status change up to the parent so the session-tab strip
@@ -75,22 +289,65 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
       ? [...prev.slice(prev.length - LOG_CAP + 1), stamped]
       : [...prev, stamped]);
   };
+  // The connect-time log box follows new lines — kept scrolled to the bottom —
+  // while the user is at the bottom. Scrolling up to read pauses that until
+  // they scroll back down; a new attempt (logs cleared) follows again. Without
+  // it the latest line, i.e. what the connection is doing right now, sat below
+  // the fold on a short window. Layout effect so it lands before paint.
+  const logBoxRef = useRef<HTMLDivElement | null>(null);
+  const logFollowRef = useRef(true);
+  useLayoutEffect(() => {
+    if (logs.length === 0) logFollowRef.current = true;
+    const el = logBoxRef.current;
+    if (el && logFollowRef.current) el.scrollTop = el.scrollHeight;
+  }, [logs]);
+  // The box only exists on the connect screen. Whenever it (re)appears —
+  // e.g. after the reconnect banner was cancelled, with lines already in it —
+  // start at the newest line and follow again.
+  const attachLogBox = useCallback((el: HTMLDivElement | null) => {
+    logBoxRef.current = el;
+    if (el) {
+      logFollowRef.current = true;
+      el.scrollTop = el.scrollHeight;
+    }
+  }, []);
   const [fingerprintPrompt, setFingerprintPrompt] = useState<any>(null);
   // Keyboard-interactive (2FA / verification-code) prompt. `kbiPrompt` holds
   // the backend payload ({ nonce, name, instructions, prompts:[{prompt,echo}] });
   // `kbiValues` mirrors one editable answer per prompt.
   const [kbiPrompt, setKbiPrompt] = useState<any>(null);
   const [kbiValues, setKbiValues] = useState<string[]>([]);
+  // Nonce of the prompt on screen, read synchronously by the dismiss
+  // listeners — state would lag a render behind a dismiss that races in.
+  const fpNonceRef = useRef<string | null>(null);
+  const kbiNonceRef = useRef<string | null>(null);
+  // The prompt's answer field takes the caret only while this session is on
+  // screen: when the prompt appears with the tab in front, or when the user
+  // switches to a tab whose prompt is waiting. A hidden tab's prompt must not
+  // swallow what's typed into the visible one.
+  const kbiFirstInputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    if (kbiPrompt && isActiveView) kbiFirstInputRef.current?.focus();
+  }, [kbiPrompt, isActiveView]);
+  // Tell the tab strip while a prompt waits on the user — a background tab's
+  // prompt is hidden along with its tab, so the tab is marked instead.
+  const promptWaiting = !!(fingerprintPrompt || kbiPrompt);
+  useEffect(() => {
+    onPromptChange?.(session.id, promptWaiting);
+  }, [onPromptChange, session.id, promptWaiting]);
+  useEffect(() => () => onPromptChange?.(session.id, false), [onPromptChange, session.id]);
   const [isAuthError, setIsAuthError] = useState(false);
   const [customPassword, setCustomPassword] = useState("");
   // The connect-time log box mirrors the terminal font-size setting, so the
   // user's chosen size applies to the startup logs too — not just the shell.
   // `submarine-settings-changed` (dispatched by Settings on save) keeps it live.
-  const readLogFontSize = () =>
-    Math.max(1, parseInt(localStorage.getItem('submarine-terminal-font-size') || '14') || 14);
-  const [logFontSize, setLogFontSize] = useState(readLogFontSize);
+  const [logFontSize, setLogFontSize] = useState(readFontSize);
+  const [logFontFamily, setLogFontFamily] = useState(() => fontFamilyCss(readFontFamily()));
   useEffect(() => {
-    const sync = () => setLogFontSize(readLogFontSize());
+    const sync = () => {
+      setLogFontSize(readFontSize());
+      setLogFontFamily(fontFamilyCss(readFontFamily()));
+    };
     window.addEventListener('submarine-settings-changed', sync);
     return () => window.removeEventListener('submarine-settings-changed', sync);
   }, []);
@@ -303,7 +560,9 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   // docker-exec session into a specific container (spawned from the Info
   // panel). Container slots stay otherwise identical — same xterm, same
   // events — they just point the backend at `open_container_terminal`.
-  const [terminals, setTerminals] = useState<{id: string, title: string, container?: { name: string; useSudo: boolean }}[]>(() => {
+  // `baseTitle`: the title a tab had before it was renamed, which an empty
+  // name brings back.
+  const [terminals, setTerminals] = useState<{id: string, title: string, baseTitle?: string, container?: { name: string; useSudo: boolean }}[]>(() => {
     return [{ id: `${session.id}-term-0`, title: '1' }];
   });
   // Bumped on every successful reconnect. TerminalView watches this prop
@@ -334,7 +593,118 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
       onTerminalsChange(session.id, terminals, activeTab);
     }
   }, [session?.id, terminals, activeTab, onTerminalsChange]);
+
+  // ── Focus the terminal when its tab (or this session's server tab) is
+  // selected ── issue #51. We don't reach into xterm from here; we bump a
+  // monotonic signal that TerminalView watches, and the terminal that is
+  // currently active focuses itself (with its own touch / input / dialog
+  // guards). `requestTerminalFocus` is the single entry point so the
+  // "don't fight an open auth prompt" rule lives in one place.
+  const [focusTick, setFocusTick] = useState(0);
+  const requestTerminalFocus = () => {
+    // A fingerprint / 2FA prompt owns the keyboard while it's up — don't
+    // yank focus out from under the user answering it. (TerminalView also
+    // refuses focus while disabled, which it is during these prompts.)
+    if (fingerprintPrompt || kbiPrompt) return;
+    setFocusTick(t => t + 1);
+  };
+  // When this SessionView becomes the frontmost server tab, pull focus into
+  // its active terminal so switching servers lets you type right away.
+  const prevActiveViewRef = useRef(isActiveView);
+  useEffect(() => {
+    const was = prevActiveViewRef.current;
+    prevActiveViewRef.current = isActiveView;
+    if (isActiveView && !was) requestTerminalFocus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isActiveView]);
+
   const [activeTool, setActiveTool] = useState<'sftp' | 'tunnels' | 'mirrors' | 'cmds' | 'info' | null>(null);
+
+  // "Push shell config": a one-shot push, not a dockable tool pane like the
+  // four above, so it gets its own preview/confirm dialog. Offered on the
+  // servers picked in Settings → Shell config sync (this device's choice).
+  const shellSyncOffered = useShellSyncServer(session.serverUuid);
+  const [shellSyncOpen, setShellSyncOpen] = useState(false);
+  const [shellSyncBusy, setShellSyncBusy] = useState(false);
+  const [shellSyncError, setShellSyncError] = useState<string | null>(null);
+  // The pairs the preview was made for: a push sends exactly those.
+  const [shellSyncPairs, setShellSyncPairs] = useState<ShellSyncPair[]>([]);
+  const [shellSyncShells, setShellSyncShells] = useState<ShellSyncShells | null>(null);
+  const [shellSyncReport, setShellSyncReport] = useState<ShellSyncReport | null>(null);
+  // A push with failures stays open to list them.
+  const [shellSyncResult, setShellSyncResult] = useState<ShellSyncPushResult | null>(null);
+  // Bumped on each opening, so that an answer meant for an earlier one is
+  // dropped.
+  const shellSyncRun = useRef(0);
+  const shellSyncPanelRef = useSlideOverFocus(shellSyncOpen);
+
+  const fmtBytes = (n: number) => {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  };
+
+  const openShellSync = async () => {
+    const run = ++shellSyncRun.current;
+    const pairs = readShellSyncPairs();
+    setShellSyncOpen(true);
+    setShellSyncError(null);
+    setShellSyncReport(null);
+    setShellSyncResult(null);
+    setShellSyncShells(null);
+    setShellSyncPairs(pairs);
+    if (pairs.length === 0) {
+      setShellSyncError("Nothing to push yet: add files in Settings → Shell config sync.");
+      return;
+    }
+    setShellSyncBusy(true);
+    // Which shell the account logs into, for a note. Not asked when new
+    // terminals start this computer's own shell anyway (Settings → Use my
+    // default shell), and never in the way of the preview.
+    if (!readUseLocalShell()) {
+      invoke<ShellSyncShells>("shell_sync_probe", { sessionId: session.id })
+        .then((s) => { if (run === shellSyncRun.current) setShellSyncShells(s); }, () => {});
+    }
+    try {
+      const report = await invoke<ShellSyncReport>("shell_sync_preview", { sessionId: session.id, pairs });
+      if (run === shellSyncRun.current) setShellSyncReport(report);
+    } catch (e: any) {
+      if (run === shellSyncRun.current) setShellSyncError(String(e));
+    } finally {
+      if (run === shellSyncRun.current) setShellSyncBusy(false);
+    }
+  };
+
+  const confirmShellSync = async () => {
+    if (!shellSyncReport) return;
+    setShellSyncBusy(true);
+    setShellSyncError(null);
+    try {
+      const result = await invoke<ShellSyncPushResult>("shell_sync_push", { sessionId: session.id, pairs: shellSyncPairs });
+      const files = `${result.pushed} file${result.pushed === 1 ? "" : "s"} (${fmtBytes(result.bytes)})`;
+      const kept = result.backup ? `; the files it replaced are in ${result.backup}` : "";
+      if (result.failed.length === 0) {
+        addLog(`Shell config: pushed ${files} to ${session.serverName}${kept}.`, "success");
+        setShellSyncOpen(false);
+      } else {
+        addLog(`Shell config: pushed ${files} to ${session.serverName}, ${result.failed.length} failed${kept}.`, "warn");
+        setShellSyncResult(result);
+      }
+    } catch (e: any) {
+      setShellSyncError(String(e));
+    } finally {
+      setShellSyncBusy(false);
+    }
+  };
+
+  // A push under way: closing then would leave its outcome nowhere to show.
+  const shellSyncPushing = shellSyncBusy && !!shellSyncReport;
+  const closeShellSync = () => {
+    if (shellSyncPushing) return;
+    shellSyncRun.current++;
+    setShellSyncBusy(false);
+    setShellSyncOpen(false);
+  };
   // Split-pane state — an ORDERED array of terminal IDs that currently
   // share the main pane. `[]` or a single-id array means "no split, use
   // the usual absolute-overlap layout"; length ≥ 2 means the panes tile
@@ -364,6 +734,20 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   // window-space, matching the pattern used by the session tab menu at
   // App level.
   const [plusMenu, setPlusMenu] = useState<{ x: number; y: number } | null>(null);
+  // A terminal tab's own menu (right-click, or a double-click straight into
+  // its name editor). A new title goes into `terminals`, so the Wall and
+  // split headers show it too.
+  const [termMenu, setTermMenu] = useState<{ x: number; y: number; termId: string } | null>(null);
+  const [termRename, setTermRename] = useState<string | null>(null);
+  useEffect(() => { if (!termMenu) setTermRename(null); }, [termMenu]);
+  const renameTerminal = (termId: string, name: string) => {
+    const title = name.trim();
+    setTerminals(prev => prev.map(t => {
+      if (t.id !== termId) return t;
+      if (!title) return t.baseTitle !== undefined ? { ...t, title: t.baseTitle, baseTitle: undefined } : t;
+      return { ...t, title, baseTitle: t.baseTitle ?? t.title };
+    }));
+  };
   // On narrow viewports the side-by-side terminal+tool layout doesn't fit.
   // We collapse to a stacked single-pane view: when a tool is open, the
   // tool takes full width and the terminal is hidden behind a back-chip.
@@ -378,6 +762,50 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     const quarter = Math.round((window.innerWidth || 1440) / 4);
     return Math.max(240, Math.min(900, quarter));
   });
+  // Which side of the terminal the tool pane docks on (see DOCK_OPTIONS).
+  // Right and left use the width above; above or below, the pane spans the
+  // full width and uses its own height.
+  const [toolDock, setToolDock] = useState<ToolDock>(() => {
+    try {
+      const v = localStorage.getItem(TOOL_DOCK_KEY);
+      return v === "left" || v === "bottom" || v === "top" ? v : "right";
+    } catch { return "right"; }
+  });
+  const setToolDockPersisted = (d: ToolDock) => {
+    setToolDock(d);
+    try { localStorage.setItem(TOOL_DOCK_KEY, d); } catch { /* ignore */ }
+  };
+  const dockTopBottom = toolDock === "bottom" || toolDock === "top";
+  // "Full screen": the open tool takes the terminal's place (the button in
+  // each tool's title bar). The terminals stay mounted and connected, hidden
+  // the way a compact window hides them, and come back when the panel is
+  // restored or closed.
+  const [toolFull, setToolFull] = useState<boolean>(() => {
+    try { return localStorage.getItem(TOOL_FULL_KEY) === "1"; } catch { return false; }
+  });
+  const setToolFullPersisted = (v: boolean) => {
+    setToolFull(v);
+    try { localStorage.setItem(TOOL_FULL_KEY, v ? "1" : "0"); } catch { /* ignore */ }
+  };
+  // The tool is shown without the terminal: always in a compact window, by
+  // choice in a roomy one.
+  const toolAlone = isCompact || toolFull;
+  // Nothing to toggle in a compact window, where the tool is always alone.
+  const fullToggle = isCompact ? null : (
+    <FullToggle full={toolFull} onToggle={() => setToolFullPersisted(!toolFull)} />
+  );
+  const [toolPanelHeight, setToolPanelHeight] = useState<number>(() => {
+    let saved = NaN;
+    try { saved = parseInt(localStorage.getItem('submarine-tool-panel-height') || '', 10); } catch { /* ignore */ }
+    if (Number.isFinite(saved) && saved >= MIN_TOOL_HEIGHT) return saved;
+    return Math.max(MIN_TOOL_HEIGHT, Math.round((window.innerHeight || 800) * 0.45));
+  });
+  // Anchor of the open "Panel position" menu, if any.
+  const [dockMenu, setDockMenu] = useState<{ x: number; y: number } | null>(null);
+  // SFTP pane: the file browser or Mirror (the button in its title bar).
+  const [sftpView, setSftpView] = useState<SftpView>("files");
+  const mainAreaRef = useRef<HTMLDivElement | null>(null);
+  const toolPanelRef = useRef<HTMLDivElement | null>(null);
 
   const initiatedRef = useRef(false);
   // Guards the per-node "run on connect" commands to fire exactly once for
@@ -433,20 +861,30 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     });
 
     const unlistenPrompt = listen(`fingerprint-prompt-${session.id}`, (event: any) => {
+      fpNonceRef.current = event.payload?.nonce ?? null;
       setFingerprintPrompt(event.payload);
     });
 
-    const unlistenPromptDismiss = listen(`fingerprint-prompt-dismiss-${session.id}`, () => {
+    // A dismiss names the prompt it closes (its nonce): one left over from an
+    // older connect attempt mustn't close the prompt that's showing now.
+    const unlistenPromptDismiss = listen(`fingerprint-prompt-dismiss-${session.id}`, (event: any) => {
+      const nonce = event.payload?.nonce;
+      if (nonce && fpNonceRef.current && nonce !== fpNonceRef.current) return;
+      fpNonceRef.current = null;
       setFingerprintPrompt(null);
     });
 
     const unlistenKbi = listen(`kbi-prompt-${session.id}`, (event: any) => {
       const p = event.payload;
+      kbiNonceRef.current = p?.nonce ?? null;
       setKbiPrompt(p);
       setKbiValues(Array.isArray(p?.prompts) ? p.prompts.map(() => "") : []);
     });
 
-    const unlistenKbiDismiss = listen(`kbi-prompt-dismiss-${session.id}`, () => {
+    const unlistenKbiDismiss = listen(`kbi-prompt-dismiss-${session.id}`, (event: any) => {
+      const nonce = event.payload?.nonce;
+      if (nonce && kbiNonceRef.current && nonce !== kbiNonceRef.current) return;
+      kbiNonceRef.current = null;
       setKbiPrompt(null);
       setKbiValues([]);
     });
@@ -512,6 +950,13 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
       const wasReconnect = reconnectAttemptRef.current > 0 || prevStatus === 'disconnected' || prevStatus === 'failed';
       setStatus('connected');
       cancelReconnect();
+      // Whatever got this connection in — the password typed into the failed
+      // screen, or one asked for — is in the tab's cache now, so forget the
+      // typed override before the secondaries below start: a mistyped one
+      // would otherwise be tried first on every reconnect and secondary
+      // connection, a failed login each time.
+      customPasswordRef.current = "";
+      setCustomPassword("");
       // On a successful RECONNECT we bump connectionEpoch instead of
       // replacing the terminals array. The terminal_id stays the same
       // (so the existing event listener keeps catching output), the
@@ -658,6 +1103,13 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     setStatus('connecting');
     setLogs([]);
     setIsAuthError(false);
+    // A prompt still showing belongs to the attempt being replaced; the
+    // backend stops it from prompting or reporting once this one starts.
+    fpNonceRef.current = null;
+    kbiNonceRef.current = null;
+    setFingerprintPrompt(null);
+    setKbiPrompt(null);
+    setKbiValues([]);
     setDisconnectReason("");
     resetSecondaryStatus();
     primarySeparateRef.current = separateFwdRef.current;
@@ -681,86 +1133,58 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     return () => window.removeEventListener(evt, onReconnect);
   }, [session.id, customPassword]);
 
-  // ---- Tool pane sizing + window growth ------------------------------------
-  // Philosophy: the terminal column is sacred. Opening a tool pane or
-  // dragging the divider grows or shrinks the OS window in lockstep so the
-  // terminal's pixel width never changes underneath the user.
-
-  const appWindow = getCurrentWindow();
-  const toolWidthRef = useRef(toolPanelWidth);
-  useEffect(() => { toolWidthRef.current = toolPanelWidth; }, [toolPanelWidth]);
-
-  const adjustWindowWidth = async (deltaPx: number) => {
-    try {
-      const size = await appWindow.outerSize();
-      const scale = await appWindow.scaleFactor();
-      const logical = size.toLogical(scale);
-      const next = Math.max(640, Math.round(logical.width + deltaPx));
-      await appWindow.setSize(new LogicalSize(next, Math.round(logical.height)));
-    } catch (e) {
-      console.error("window resize failed", e);
-    }
-  };
-
-  // Grow the window when the tool pane is opened, shrink when it's closed.
-  // The +4 accounts for the resize divider itself.
-  const prevActiveToolRef = useRef<typeof activeTool>(null);
-  useEffect(() => {
-    const prev = prevActiveToolRef.current;
-    prevActiveToolRef.current = activeTool;
-    if (!prev && activeTool) {
-      adjustWindowWidth(toolWidthRef.current + 4);
-    } else if (prev && !activeTool) {
-      adjustWindowWidth(-(toolWidthRef.current + 4));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTool]);
-
-  // If the user closes the session tab while a tool is open, give the
-  // window space back rather than leaving it stretched.
-  useEffect(() => {
-    return () => {
-      if (prevActiveToolRef.current) {
-        adjustWindowWidth(-(toolWidthRef.current + 4));
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // ---- Tool pane sizing ----------------------------------------------------
+  // The pane and the terminal share the window: opening the pane or dragging
+  // its divider sizes the two against each other. The window itself is never
+  // resized from here. Its size belongs to the user, and the window-state
+  // plugin restores it.
 
   const startToolResize = (e: React.MouseEvent) => {
     e.preventDefault();
+    if (dockTopBottom) {
+      // Dragging toward the terminal grows the pane.
+      const startY = e.clientY;
+      const area = mainAreaRef.current?.clientHeight ?? window.innerHeight;
+      const maxHeight = Math.max(MIN_TOOL_HEIGHT, area - MIN_TERMINAL_HEIGHT - 4);
+      // Start from what's on screen: a height saved in a taller window
+      // shows capped.
+      const startHeight = Math.min(maxHeight, toolPanelRef.current?.getBoundingClientRect().height ?? toolPanelHeight);
+      const sign = toolDock === "bottom" ? 1 : -1;
+      let latest = startHeight;
+      const onMove = (ev: MouseEvent) => {
+        latest = Math.round(Math.max(MIN_TOOL_HEIGHT, Math.min(maxHeight, startHeight + sign * (startY - ev.clientY))));
+        setToolPanelHeight(latest);
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        try { localStorage.setItem("submarine-tool-panel-height", String(latest)); }
+        catch { /* ignore */ }
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      return;
+    }
     const startX = e.clientX;
-    const startWidth = toolWidthRef.current;
-    let lastCommittedWidth = startWidth;
-    let pendingWidth = startWidth;
-    let frameRequested = false;
+    const area = mainAreaRef.current?.clientWidth ?? window.innerWidth;
+    const maxWidth = Math.max(240, Math.min(900, area - MIN_TERMINAL_WIDTH - 4));
+    // Start from what's on screen: a width saved in a wider window shows
+    // capped.
+    const startWidth = Math.min(maxWidth, toolPanelRef.current?.getBoundingClientRect().width ?? toolPanelWidth);
+    let latest = startWidth;
 
     const onMove = (ev: MouseEvent) => {
-      // Dragging LEFT (cursor moves left) widens the tool pane.
-      const next = Math.max(240, Math.min(900, startWidth + (startX - ev.clientX)));
-      pendingWidth = next;
-      setToolPanelWidth(next);
-      // Throttle window resizes to one per animation frame. setSize crosses an
-      // IPC boundary and dispatching it on every mousemove makes the drag feel
-      // laggy. We batch by recomputing the delta against last-committed width
-      // inside the frame, so no mouse movement is dropped.
-      if (!frameRequested) {
-        frameRequested = true;
-        requestAnimationFrame(() => {
-          frameRequested = false;
-          const delta = pendingWidth - lastCommittedWidth;
-          if (delta !== 0) {
-            lastCommittedWidth = pendingWidth;
-            adjustWindowWidth(delta);
-          }
-        });
-      }
+      // Dragging toward the terminal widens the tool pane: left for a pane
+      // on the right, right for a pane on the left.
+      const pulled = toolDock === "left" ? ev.clientX - startX : startX - ev.clientX;
+      latest = Math.round(Math.max(240, Math.min(maxWidth, startWidth + pulled)));
+      setToolPanelWidth(latest);
     };
 
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
-      try { localStorage.setItem("submarine-tool-panel-width", String(toolWidthRef.current)); }
+      try { localStorage.setItem("submarine-tool-panel-width", String(latest)); }
       catch { /* ignore */ }
     };
 
@@ -775,6 +1199,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     // (or a hostile script that knows only the session id) can't accept
     // a fingerprint on the user's behalf.
     const nonce = fingerprintPrompt?.nonce;
+    fpNonceRef.current = null;
     setFingerprintPrompt(null);
     if (!nonce) return;
     try {
@@ -791,6 +1216,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   const handleKbiSubmit = async () => {
     const nonce = kbiPrompt?.nonce;
     const responses = kbiValues;
+    kbiNonceRef.current = null;
     setKbiPrompt(null);
     setKbiValues([]);
     if (!nonce) return;
@@ -803,6 +1229,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
 
   const handleKbiCancel = async () => {
     const nonce = kbiPrompt?.nonce;
+    kbiNonceRef.current = null;
     setKbiPrompt(null);
     setKbiValues([]);
     if (!nonce) return;
@@ -895,6 +1322,11 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
               <h3 className="text-sm font-bold text-primary uppercase tracking-widest">
                 {kbiPrompt.name && String(kbiPrompt.name).trim() ? kbiPrompt.name : "Verification required"}
               </h3>
+              {/* Which server is asking — the server's own wording rarely
+                  says, and several tabs can be connecting at once. */}
+              <p className="mt-0.5 text-[11.5px] text-zinc-500 truncate" title={session.serverName}>
+                {displayName || session.serverName}
+              </p>
               {kbiPrompt.instructions && String(kbiPrompt.instructions).trim() && (
                 <p className="text-zinc-400 mt-2 leading-relaxed whitespace-pre-wrap break-words">
                   {kbiPrompt.instructions}
@@ -908,8 +1340,13 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                     </label>
                     <input
                       type={p?.echo ? "text" : "password"}
-                      autoFocus={i === 0}
+                      ref={i === 0 ? kbiFirstInputRef : undefined}
                       className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-sm text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all"
+                      // A login name or code, never prose: a phone keyboard
+                      // must not capitalise "alice" into "Alice".
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
                       value={kbiValues[i] ?? ""}
                       onChange={e => setKbiValues(vals => {
                         const next = [...vals];
@@ -944,50 +1381,91 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     </>
   );
 
+  // Host-key / 2FA / login prompts float over THIS session's area — centered
+  // and scrolling on their own, whatever the log's scroll — but never over the
+  // title bar, another tab or another split pane, and below the app's own
+  // dialogs. A background tab's prompt stays hidden with its tab (the tab
+  // strip marks it via onPromptChange), so it can't pop up over whatever the
+  // user is doing. No aria-modal: it only blocks this session.
+  const promptOverlay = (
+    <div
+      role="dialog"
+      aria-label={`Connection prompt for ${session.serverName}`}
+      className="absolute inset-0 z-40 flex items-start justify-center bg-black/70 backdrop-blur-sm p-4 sm:p-8 overflow-y-auto"
+    >
+      <div className="max-w-2xl w-full mt-6 sm:mt-12">
+        {authPrompts}
+      </div>
+    </div>
+  );
+
   // Only render the full-screen log view for the FIRST connection — once an
   // auto-reconnect cycle is running, the user's terminal output and SFTP
   // state stay visible behind a slim banner.
   if (reconnectAttempt === 0 && (status === 'connecting' || status === 'failed')) {
     return (
-      <div className="flex-1 flex flex-col p-4 sm:p-8 bg-[#0a0a0c] text-white overflow-hidden">
+      <div className="relative flex-1 flex flex-col p-4 sm:p-8 bg-[#0a0a0c] text-white overflow-hidden">
         <div className="max-w-2xl w-full mx-auto flex-1 flex flex-col min-h-0">
-          {/* Header: on desktop, title row keeps title + actions side-by-side.
-              On phone, wide letter-spacing on the title wraps "0-1 AMIR" onto
-              three lines and the Reconnect / Close buttons get pushed past
-              the viewport. We stack vertically and trim the typography so
-              the whole header fits in two compact rows at any width. */}
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4 sm:mb-6">
-            <div>
-              <h2 className="text-base sm:text-xl font-black uppercase tracking-wider sm:tracking-[0.2em] break-words">
-                {session.serverName}
+          {/* Header: status chip + server name on the left, actions on the
+              right — one row at every width. The name is regular-case text
+              that truncates instead of wrapping (a long user@host used to
+              wrap and push the buttons onto their own line), and on phones
+              the buttons collapse to icons. Close is there while connecting
+              too, so a hung attempt can be abandoned from this screen. */}
+          <div className="flex items-center gap-3 mb-3 sm:mb-4">
+            <div
+              className={`shrink-0 w-9 h-9 rounded-xl flex items-center justify-center ${
+                status === 'failed' ? 'bg-red-500/10 text-red-400' : 'bg-primary/10 text-primary'
+              }`}
+              aria-hidden="true"
+            >
+              {status === 'connecting' ? <Loader2 size={16} className="animate-spin" /> : <AlertTriangle size={16} />}
+            </div>
+            <div className="min-w-0 flex-1">
+              <h2 className="text-sm font-semibold text-zinc-100 truncate" title={session.serverName}>
+                {displayName || session.serverName}
               </h2>
-              <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest mt-1">
-                {status === 'connecting' ? 'Establishing Connection...' : 'Connection Failed'}
+              <p className={`text-[11px] mt-0.5 ${status === 'failed' ? 'text-red-400/90' : 'text-zinc-500'}`}>
+                {status === 'connecting' ? 'Connecting…' : 'Connection failed'}
               </p>
             </div>
-            {status === 'failed' && (
-              <div className="flex flex-wrap gap-2 items-center">
-                {isAuthError && (
-                  <input
-                    type="password"
-                    placeholder="Password..."
-                    className="h-8 flex-1 min-w-0 sm:flex-none bg-[#1a1a1e] rounded-lg px-3 text-xs text-white border border-white/10 outline-none focus:border-primary/50"
-                    value={customPassword}
-                    onChange={e => setCustomPassword(e.target.value)}
-                    onKeyDown={e => {
-                      if(e.key === 'Enter') reconnect();
-                    }}
-                  />
-                )}
-                <button onClick={reconnect} className="flex-1 sm:flex-none px-4 py-2 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors">
-                  Reconnect
+            <div className="shrink-0 flex items-center gap-2">
+              {status === 'failed' && (
+                <button
+                  onClick={reconnect}
+                  title="Reconnect"
+                  aria-label="Reconnect"
+                  className="h-8 px-2.5 sm:px-3 flex items-center gap-1.5 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 text-xs font-semibold transition-colors"
+                >
+                  <RotateCw size={13} /><span className="hidden sm:inline">Reconnect</span>
                 </button>
-                <button onClick={onClose} className="flex-1 sm:flex-none px-4 py-2 bg-red-500/10 text-red-500 hover:bg-red-500/20 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors">
-                  Close Session
-                </button>
-              </div>
-            )}
+              )}
+              <button
+                onClick={onClose}
+                title="Close session"
+                aria-label="Close session"
+                className="h-8 px-2.5 sm:px-3 flex items-center gap-1.5 rounded-lg bg-white/5 text-zinc-300 hover:bg-red-500/15 hover:text-red-300 text-xs font-semibold transition-colors"
+              >
+                <X size={13} /><span className="hidden sm:inline">Close</span>
+              </button>
+            </div>
           </div>
+
+          {/* Auth failed: try another password without leaving the screen. Its
+              own row, so it never squeezes the header. Enter reconnects. */}
+          {status === 'failed' && isAuthError && (
+            <input
+              type="password"
+              aria-label="Password"
+              placeholder="Try another password — press Enter to reconnect"
+              className="h-8 w-full mb-3 sm:mb-4 bg-[#1a1a1e] rounded-lg px-3 text-xs text-white border border-white/10 outline-none focus:border-primary/50"
+              value={customPassword}
+              onChange={e => setCustomPassword(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') reconnect();
+              }}
+            />
+          )}
 
           {/* Log Window. `min-h-0` is what makes it actually scroll: a flex
               child defaults to min-height:auto (its content height), so without
@@ -998,8 +1476,15 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
               overscroll-contain keeps a flick from scrolling the page behind it;
               WebkitOverflowScrolling gives older Android WebViews momentum. */}
           <div
+            ref={attachLogBox}
+            onScroll={(e) => {
+              // Follow only while (nearly) at the bottom — a few px of slack
+              // for sub-pixel rounding after our own scroll.
+              const el = e.currentTarget;
+              logFollowRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 32;
+            }}
             className="flex-1 min-h-0 bg-[#121214] border border-white/5 rounded-2xl p-4 font-mono overflow-y-auto overscroll-contain custom-scrollbar shadow-inner relative select-text cursor-text"
-            style={{ WebkitOverflowScrolling: 'touch', fontSize: logFontSize, lineHeight: 1.5 }}
+            style={{ WebkitOverflowScrolling: 'touch', fontSize: logFontSize, fontFamily: logFontFamily, lineHeight: 1.5 }}
           >
             {logs.map((l, i) => (
               <div key={i} className={`mb-2 ${l.type === 'error' ? 'text-red-400' : l.type === 'success' ? 'text-primary' : 'text-zinc-400'}`}>
@@ -1007,30 +1492,29 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                 {l.msg}
               </div>
             ))}
-
-            {authPrompts}
           </div>
+
+          {/* The prompt floats over this session instead of being appended to
+              the bottom of the scroll-box above, where a short window — or a
+              long keyboard-interactive banner before the code prompt — pushed
+              the input below the fold and the connection looked "stuck at
+              2FA" (#27). See promptOverlay. */}
+          {promptWaiting && promptOverlay}
         </div>
       </div>
     );
   }
 
+  const DockIcon = (DOCK_OPTIONS.find((o) => o.id === toolDock) ?? DOCK_OPTIONS[0]).Icon;
+
   // Connected State with Nested Tabs
   return (
-    <div className="flex-1 flex flex-col bg-background overflow-hidden animate-in fade-in">
+    <div className="relative flex-1 flex flex-col bg-background overflow-hidden animate-in fade-in">
       {/* Auth prompts during an AUTO-RECONNECT. The full-screen view above only
           renders on the first connect (reconnectAttempt===0); once a reconnect
-          cycle is running we show the terminal behind a slim banner, so a
-          fingerprint / 2FA prompt fired mid-reconnect would otherwise be
-          invisible and unanswerable. Float it over everything via a portal. */}
-      {(fingerprintPrompt || kbiPrompt) && createPortal(
-        <div className="fixed inset-0 z-[200] flex items-start justify-center bg-black/70 backdrop-blur-sm p-4 sm:p-8 overflow-y-auto">
-          <div className="max-w-2xl w-full mt-6 sm:mt-12">
-            {authPrompts}
-          </div>
-        </div>,
-        document.body
-      )}
+          cycle is running we show the terminal behind a slim banner, so the
+          prompt floats over it — see promptOverlay. */}
+      {promptWaiting && promptOverlay}
       {/* Nested Tab Bar — hidden in `chromeless` mode. Chromeless is
           used by the App-level Split-view tiling: merged (non-focused)
           panes show only the active terminal, no per-session tab strip
@@ -1038,7 +1522,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
           full chrome and 2-3 sessions side-by-side would fight for
           vertical space with duplicate toolbars. */}
       {!chromeless && (
-      <div className="h-12 border-b border-white/5 bg-[#121214]/50 flex items-center px-2 sm:px-4 shrink-0 justify-between gap-1">
+      <div inert={shellSyncOpen ? "" : undefined} className="h-12 border-b border-white/5 bg-[#121214]/50 flex items-center px-2 sm:px-4 shrink-0 justify-between gap-1">
         <div
           className="flex items-center gap-1 overflow-x-auto no-scrollbar flex-1 mr-1 sm:mr-4 mask-fade-right"
           onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
@@ -1050,7 +1534,10 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
           const isFocusedHalf = activeTab === t.id;
           const isSplitPartner = !!(splitTerminals.includes(t.id) && !isFocusedHalf);
           return (
-          <div key={t.id} className="group relative flex items-center">
+          <div key={t.id} className="group relative flex items-center"
+            onContextMenu={(e) => { e.preventDefault(); setTermMenu({ x: e.clientX, y: e.clientY, termId: t.id }); }}
+            onDoubleClick={(e) => { setTermMenu({ x: e.clientX, y: e.clientY, termId: t.id }); setTermRename(t.id); }}
+          >
             <button
               onClick={() => {
                 // Clicking a tab NOT participating in the current split
@@ -1062,6 +1549,10 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                   setSplitRatios([]);
                 }
                 setActiveTab(t.id);
+                // Land the caret in the terminal even when the active one
+                // didn't change (re-clicking the current tab, or focus was in
+                // a tool pane / another input) — issue #51.
+                requestTerminalFocus();
               }}
               title={t.container ? `Container: ${t.container.name}` : undefined}
               className={`h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8' : ''} rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${
@@ -1105,7 +1596,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                   }
                 }}
                 aria-label="Close terminal"
-                className="absolute right-1 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all"
+                className="absolute right-1 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all"
               >
                 <X size={12} />
               </button>
@@ -1179,6 +1670,38 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
               </button>
             );
           })}
+          {/* "Push shell config": only on the servers picked in Settings →
+              Shell config sync, not all of them. Unlike the four tabs above
+              it doesn't dock a panel: it's a one-shot push, so it opens a
+              preview/confirm dialog instead (see shellSyncOpen below). */}
+          {shellSyncOffered && (
+            <button
+              onClick={openShellSync}
+              disabled={status !== 'connected'}
+              title="Push shell config: your files from Settings → Shell config sync, to this server"
+              aria-label="Push shell config"
+              className="h-10 sm:h-8 px-2.5 rounded-lg flex items-center gap-1.5 transition-all text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+            >
+              <UploadCloud size={14} className="shrink-0" />
+              <span className="hidden md:inline text-[11px] font-semibold tracking-tight">Shell</span>
+            </button>
+          )}
+          {/* Where the tool pane sits around the terminal. Compact windows
+              show the tool full screen, so there is nothing to place. */}
+          {!isCompact && (
+            <button
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                setDockMenu({ x: r.right, y: r.bottom + 4 });
+              }}
+              title="Panel position"
+              aria-label="Panel position"
+              aria-haspopup="menu"
+              className="h-10 sm:h-8 px-2 rounded-lg flex items-center text-zinc-400 border border-transparent hover:bg-white/[0.08] hover:border-white/20 hover:text-white transition-all"
+            >
+              <DockIcon size={14} />
+            </button>
+          )}
         </div>
       </div>
       )}
@@ -1256,6 +1779,72 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
         document.body
       )}
 
+      {/* A terminal tab's menu: its name, edited in place. Enter keeps it
+          (an empty one brings back the tab's first title), Esc goes back
+          to the menu. */}
+      {termMenu && terminals.some(t => t.id === termMenu.termId) && createPortal(
+        <>
+          <div
+            className="fixed inset-0 z-[9998]"
+            onClick={() => setTermMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setTermMenu(null); }}
+          />
+          <div
+            style={{ left: Math.min(termMenu.x, window.innerWidth - 240), top: Math.min(termMenu.y, window.innerHeight - 80) }}
+            className="fixed z-[9999] w-[220px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+          >
+            {termRename === termMenu.termId ? (
+              <RenameInput
+                initialValue={terminals.find(t => t.id === termMenu.termId)?.title ?? ""}
+                placeholder="Tab name (empty: the first one)"
+                onCommit={(v) => { renameTerminal(termMenu.termId, v); setTermMenu(null); }}
+                onCancel={() => setTermRename(null)}
+              />
+            ) : (
+              <button
+                onClick={() => setTermRename(termMenu.termId)}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+              >
+                <span className="flex-1">Rename tab</span>
+              </button>
+            )}
+          </div>
+        </>,
+        document.body
+      )}
+
+      {dockMenu && createPortal(
+        <>
+          <div
+            className="fixed inset-0 z-[9998]"
+            onClick={() => setDockMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setDockMenu(null); }}
+          />
+          <div
+            role="menu"
+            aria-label="Panel position"
+            style={{ left: Math.max(8, Math.min(dockMenu.x - 210, window.innerWidth - 218)), top: Math.min(dockMenu.y, window.innerHeight - 170) }}
+            className="fixed z-[9999] w-[210px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+          >
+            <div className="px-3 pt-1 pb-1.5 text-[9.5px] font-bold uppercase tracking-wider text-zinc-500">Panel position</div>
+            {DOCK_OPTIONS.map(({ id, label, Icon }) => (
+              <button
+                key={id}
+                role="menuitemradio"
+                aria-checked={toolDock === id}
+                onClick={() => { setToolDockPersisted(id); setToolFullPersisted(false); setDockMenu(null); }}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+              >
+                <Icon size={13} className={toolDock === id ? "text-primary" : "text-zinc-500"} />
+                <span className="flex-1">{label}</span>
+                {toolDock === id && <Check size={12} className="text-primary" />}
+              </button>
+            ))}
+          </div>
+        </>,
+        document.body
+      )}
+
       {/* Disconnection / auto-reconnect banner. Pinned to the top so it's
           visible whether the terminal or SFTP is in focus. The disabled
           overlay inside TerminalView / SftpWorkspace / TunnelsPanel does the
@@ -1307,12 +1896,20 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
           and the terminal is hidden — the tool tabs themselves act as the
           "back to terminal" affordance (clicking the active tool toggles
           it off). This avoids squeezing a usable terminal + tool into a
-          mobile-sized window. */}
-      <div className="flex-1 flex overflow-hidden relative bg-[#09090b]">
+          mobile-sized window. Elsewhere the tool docks on the side the user
+          picked (toolDock), unless they made it full screen (toolFull),
+          which shows it alone the same way. */}
+      <div
+        ref={mainAreaRef}
+        // Behind the push dialog: Tab can't reach the terminal under it.
+        inert={shellSyncOpen ? "" : undefined}
+        className={`flex-1 flex overflow-hidden relative bg-[#09090b] ${toolAlone ? "" : DOCK_FLEX[toolDock]}`}
+      >
         {/* Left Panel: Active Terminals.
-            On compact + activeTool, hide entirely so the tool fills the
-            screen. Terminals stay mounted (no PTY teardown) — just CSS
-            hidden so swapping back keeps the same shell session.
+            With a tool open in a compact window, or made full screen, hide
+            entirely so the tool fills the screen. Terminals stay mounted (no
+            PTY teardown) — just CSS hidden so swapping back keeps the same
+            shell session.
 
             Split mode: when `splitTerminals` holds 2+ ids and the
             viewport is roomy enough, we tile those terminals side-by-side
@@ -1321,7 +1918,11 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
             hidden — so switching a tab that isn't in the split preserves
             its scrollback. The tiles fill the whole left panel; the tool
             side panel continues to work exactly as before. */}
-        <div className={`h-full relative ${activeTool && isCompact ? 'hidden' : 'flex-1 min-w-0'}`}>
+        <div className={`relative ${
+          activeTool && toolAlone ? 'hidden'
+            : dockTopBottom && !toolAlone ? 'w-full flex-1 min-h-0'
+            : 'h-full flex-1 min-w-0'
+        }`}>
           {splitTerminals.length >= 2 && !isCompact ? (
             <div className={`absolute inset-0 flex ${splitOrientation === "h" ? "flex-row" : "flex-col"}`}>
               {splitTerminals.map((termId, slotIdx) => {
@@ -1346,7 +1947,9 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                       sessionId={session.id}
                       terminalId={t.id}
                       disabled={status !== 'connected'}
-                      isActive={isFocused && !(activeTool && isCompact)}
+                      isActive={isFocused && !(activeTool && toolAlone)}
+                      isActiveView={isActiveView}
+                      focusSignal={focusTick}
                       containerExec={t.container ? { container: t.container.name, useSudo: t.container.useSudo } : undefined}
                       connectionEpoch={connectionEpoch}
                       serverId={session.serverId}
@@ -1371,7 +1974,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                         }
                       }}
                       title="Remove this pane from the split (keeps the terminal)"
-                      className="absolute top-1 right-1 z-30 h-5 w-5 rounded flex items-center justify-center bg-black/40 border border-white/10 text-zinc-400 hover:text-white hover:bg-black/60 opacity-0 hover:opacity-100 group-hover/pane:opacity-100 transition-opacity"
+                      className="absolute top-1 right-1 z-30 h-5 w-5 rounded flex items-center justify-center bg-black/40 border border-white/10 text-zinc-400 hover:text-white hover:bg-black/60 opacity-0 hover:opacity-100 group-hover/pane:opacity-100 focus-visible:opacity-100 transition-opacity"
                     >
                       <X size={11} />
                     </button>
@@ -1462,12 +2065,16 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
             </div>
           ) : (
             terminals.map(t => (
-              <div key={t.id} className={`absolute inset-0 ${activeTab === t.id ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'}`}>
+              // A background tab stays mounted (its shell keeps running) but
+              // inert, so Tab can't land in a terminal that isn't shown.
+              <div key={t.id} inert={activeTab === t.id ? undefined : ""} className={`absolute inset-0 ${activeTab === t.id ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'}`}>
                 <TerminalView
                   sessionId={session.id}
                   terminalId={t.id}
                   disabled={status !== 'connected'}
-                  isActive={activeTab === t.id && !(activeTool && isCompact)}
+                  isActive={activeTab === t.id && !(activeTool && toolAlone)}
+                  isActiveView={isActiveView}
+                  focusSignal={focusTick}
                   containerExec={t.container ? { container: t.container.name, useSudo: t.container.useSudo } : undefined}
                   connectionEpoch={connectionEpoch}
                   serverId={session.serverId}
@@ -1479,10 +2086,12 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
         </div>
 
         {/* Resizable divider — only useful when both panes are visible. */}
-        {activeTool && !isCompact && (
+        {activeTool && !toolAlone && (
           <div
             onMouseDown={startToolResize}
-            className="w-1 shrink-0 cursor-col-resize bg-white/5 hover:bg-primary/40 transition-colors"
+            className={`shrink-0 bg-white/5 hover:bg-primary/40 transition-colors ${
+              dockTopBottom ? 'h-1 cursor-row-resize' : 'w-1 cursor-col-resize'
+            }`}
             title="Drag to resize"
           />
         )}
@@ -1494,34 +2103,46 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
             tree was torn down. Other tools still conditional-render: they
             don't carry live state worth preserving across switches. */}
         <div
-          style={activeTool && !isCompact ? { width: `${toolPanelWidth}px` } : undefined}
-          className={`${activeTool ? (isCompact ? 'flex-1 min-w-0' : 'shrink-0') : 'hidden'} bg-[#121214]/95 flex flex-col h-full overflow-hidden ${activeTool ? 'animate-in slide-in-from-right duration-300' : ''}`}
+          ref={toolPanelRef}
+          style={activeTool && !toolAlone
+            ? (dockTopBottom
+                ? { height: `${toolPanelHeight}px`, maxHeight: `calc(100% - ${MIN_TERMINAL_HEIGHT + 4}px)` }
+                : { width: `${toolPanelWidth}px`, maxWidth: `calc(100% - ${MIN_TERMINAL_WIDTH + 4}px)` })
+            : undefined}
+          className={`${activeTool ? (toolAlone ? 'flex-1 min-w-0' : 'shrink-0') : 'hidden'} bg-[#121214]/95 flex flex-col ${dockTopBottom && !toolAlone ? 'w-full' : 'h-full'} overflow-hidden ${activeTool ? 'animate-in slide-in-from-right duration-300' : ''}`}
         >
           {activeTool === 'sftp' && (
             <div className="flex-1 flex flex-col overflow-hidden">
-              <div className="h-10 px-4 flex items-center justify-between gap-3 border-b border-white/5 bg-white/5">
-                <div className="flex items-center gap-3 min-w-0">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 shrink-0">SFTP File Browser</span>
+              <ToolTitleBar
+                title="SFTP File Browser"
+                shortTitle="SFTP"
+                toggle={
                   <SepToggle
                     on={separateSftp}
                     onToggle={toggleSeparateSftp}
                     status={!separateSftp ? 'off' : sftpConnStatus === 'ready' ? 'ready' : sftpConnStatus === 'failed' ? 'failed' : 'pending'}
-                    title="Run SFTP over its own dedicated SSH connection instead of sharing the terminal's session"
+                    hint="SFTP runs on its own SSH connection, so large transfers don't slow the terminal down."
                     onReconnect={reconnectSftpConn}
                   />
-                </div>
-                <button onClick={() => setActiveTool(null)} className="text-zinc-500 hover:text-white transition-colors shrink-0">
-                  <X size={14} />
-                </button>
-              </div>
+                }
+                mirror={{
+                  on: sftpView === 'mirror',
+                  disabled: !session.serverId,
+                  onToggle: () => setSftpView(v => v === 'mirror' ? 'files' : 'mirror'),
+                }}
+                extra={fullToggle}
+                onClose={() => setActiveTool(null)}
+              />
               <div className="flex-1 overflow-hidden relative">
                 <SftpWorkspace
                   sessionId={session.id}
                   disabled={status !== 'connected'}
                   serverId={session.serverId}
+                  profile={profile}
                   mirrorsConfig={(() => {
                     try { return JSON.parse(session.mirrors || "[]"); } catch { return []; }
                   })()}
+                  view={sftpView}
                 />
               </div>
             </div>
@@ -1529,21 +2150,21 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
 
           {activeTool === 'tunnels' && (
             <div className="flex-1 flex flex-col overflow-hidden">
-              <div className="h-10 px-4 flex items-center justify-between gap-3 border-b border-white/5 bg-white/5">
-                <div className="flex items-center gap-3 min-w-0">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 shrink-0">Port Forwarding</span>
+              <ToolTitleBar
+                title="Port Forwarding"
+                shortTitle="Ports"
+                toggle={
                   <SepToggle
                     on={separateFwd}
                     onToggle={toggleSeparateFwd}
                     status={!separateFwd ? 'off' : fwdConnStatus === 'ready' ? 'ready' : fwdConnStatus === 'failed' ? 'failed' : 'pending'}
-                    title="Run port-forwarding over its own dedicated SSH connection instead of sharing the terminal's session"
+                    hint="Port forwards run on their own SSH connection, so heavy traffic doesn't slow the terminal down."
                     onReconnect={reconnectFwdConn}
                   />
-                </div>
-                <button onClick={() => setActiveTool(null)} className="text-zinc-500 hover:text-white transition-colors shrink-0">
-                  <X size={14} />
-                </button>
-              </div>
+                }
+                extra={fullToggle}
+                onClose={() => setActiveTool(null)}
+              />
               <div className="flex-1 overflow-hidden relative">
                 <TunnelsPanel sessionId={session.id} serverId={session.serverId} disabled={status !== 'connected'} />
               </div>
@@ -1554,6 +2175,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
             <CmdsPanel
               activeTab={activeTab}
               onClose={() => setActiveTool(null)}
+              headerActions={fullToggle}
               serverId={session.serverId}
               serverName={session.serverName}
             />
@@ -1564,11 +2186,14 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
               explicitly asked for "cache while session is alive", and a
               fresh remount would re-fire the probe every tab swap. */}
           <div className={`flex-1 flex flex-col overflow-hidden ${activeTool === 'info' ? '' : 'hidden'}`}>
-            <div className="h-10 px-4 flex items-center justify-between border-b border-white/5 bg-white/5">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Server Info</span>
-              <button onClick={() => setActiveTool(null)} className="text-zinc-500 hover:text-white transition-colors">
-                <X size={14} />
-              </button>
+            <div className="h-10 px-4 flex items-center justify-between gap-3 border-b border-white/5 bg-white/5">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 truncate">Server Info</span>
+              <div className="flex items-center gap-2 shrink-0">
+                {fullToggle}
+                <button onClick={() => setActiveTool(null)} aria-label="Close" className="text-zinc-500 hover:text-white transition-colors">
+                  <X size={14} />
+                </button>
+              </div>
             </div>
             <InfoPanel
               sessionId={session.id}
@@ -1579,6 +2204,172 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
           </div>
         </div>
       </div>
+
+      {/* Push shell config — preview/confirm dialog. Scoped to this session
+          (absolute, not a document.body portal) like promptOverlay above,
+          since it only makes sense for the session whose toolbar button
+          opened it. The session behind it is inert while it's open. */}
+      {shellSyncOpen && (() => {
+        const entries = shellSyncReport?.entries ?? [];
+        const pushes = entries.filter((e) => e.action === "new" || e.action === "update" || e.action === "server-newer");
+        const replaces = pushes.some((e) => e.action !== "new");
+        const badge = (e: ShellSyncEntry): [string, string] => {
+          switch (e.action) {
+            case "new": return ["new", "text-emerald-400"];
+            case "update": return ["update", "text-amber-400"];
+            case "server-newer": return ["newer on the server", "text-rose-400"];
+            case "skip-private": return [`not pushed: ${e.reason ?? "private"}`, "text-zinc-500"];
+            case "skip-link": return ["a link there: left alone", "text-zinc-500"];
+            case "skip-folder": return ["a folder there: left alone", "text-zinc-500"];
+            default: return ["not a file there: left alone", "text-zinc-500"];
+          }
+        };
+        const remoteShell = shellSyncShells?.remote_shell.split("/").pop() || "another shell";
+        return (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={`shell-sync-title-${session.id}`}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.stopPropagation();
+                closeShellSync();
+              }
+            }}
+            className="absolute inset-0 z-50 flex items-start justify-center bg-black/70 backdrop-blur-sm p-4 sm:p-8 overflow-y-auto"
+          >
+            <div
+              ref={shellSyncPanelRef}
+              tabIndex={-1}
+              className="max-w-xl w-full mt-6 sm:mt-12 bg-[#121215] border border-white/10 rounded-2xl shadow-2xl overflow-hidden outline-none"
+            >
+              <div className="px-5 py-4 border-b border-white/5 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 min-w-0">
+                  <UploadCloud size={15} className="text-primary shrink-0" />
+                  <h3 id={`shell-sync-title-${session.id}`} className="text-sm font-semibold text-zinc-100 truncate">
+                    Push shell config → {session.serverName}
+                  </h3>
+                </div>
+                <button
+                  onClick={closeShellSync}
+                  disabled={shellSyncPushing}
+                  aria-label="Close"
+                  className="shrink-0 text-zinc-500 hover:text-white transition-colors disabled:opacity-40"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+
+              <div className="px-5 py-4 space-y-3 max-h-[60vh] overflow-y-auto">
+                {shellSyncBusy && !shellSyncReport && (
+                  <div className="flex items-center gap-2 text-sm text-zinc-400 py-4">
+                    <Loader2 size={14} className="animate-spin" /> Checking what would change…
+                  </div>
+                )}
+
+                {shellSyncError && (
+                  <div className="flex items-start gap-2 text-[12px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2.5">
+                    <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                    <span className="whitespace-pre-line break-words min-w-0">{shellSyncError}</span>
+                  </div>
+                )}
+
+                {shellSyncShells?.shell_mismatch && !shellSyncResult && (
+                  <div className="flex items-start gap-2 text-[12px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2.5">
+                    <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                    <span>
+                      This computer's shell is <strong>{shellSyncShells.local_shell}</strong>, but this account
+                      logs into <strong>{remoteShell}</strong> on the server: files for {shellSyncShells.local_shell} are
+                      only read there once the account's shell changes, or with Settings → Use my default shell.
+                    </span>
+                  </div>
+                )}
+
+                {shellSyncResult && (
+                  <div className="space-y-2">
+                    <p className="text-[12px] text-zinc-300">
+                      Pushed {shellSyncResult.pushed} file{shellSyncResult.pushed === 1 ? "" : "s"}. These failed:
+                    </p>
+                    <div className="rounded-lg border border-red-500/20 divide-y divide-white/5 overflow-hidden">
+                      {shellSyncResult.failed.map((f, i) => (
+                        <div key={i} className="px-3 py-2 text-[12px]">
+                          <div className="truncate text-zinc-200" title={f.remote}>{f.remote}</div>
+                          <div className="text-red-400 break-words">{f.error}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {shellSyncResult.backup && (
+                      <p className="text-[11px] text-zinc-500">The files it replaced are in {shellSyncResult.backup} on the server.</p>
+                    )}
+                  </div>
+                )}
+
+                {shellSyncReport && !shellSyncResult && (
+                  entries.length === 0 ? (
+                    <p className="text-sm text-zinc-400 py-2">Everything is up to date: nothing to push.</p>
+                  ) : (
+                    <>
+                      <p className="text-[11px] text-zinc-500">
+                        {pushes.length === 0
+                          ? "Nothing to push"
+                          : `${pushes.length} file${pushes.length === 1 ? "" : "s"} · ${fmtBytes(shellSyncReport.total_bytes)}`}
+                        {" "}· into {shellSyncReport.home} on the server
+                      </p>
+                      <div className="rounded-lg border border-white/10 divide-y divide-white/5 overflow-hidden">
+                        {entries.map((e, i) => {
+                          const [text, tone] = badge(e);
+                          const sends = pushes.includes(e);
+                          return (
+                            <div key={i} className="px-3 py-2 text-[12px]">
+                              <div className="flex items-center gap-2">
+                                <span className={`flex-1 min-w-0 truncate ${sends ? "text-zinc-300" : "text-zinc-500"}`} title={`${e.local} → ${e.remote}`}>
+                                  {e.remote}
+                                </span>
+                                {sends && <span className="shrink-0 text-zinc-500">{fmtBytes(e.size)}</span>}
+                                <span className={`shrink-0 text-[10px] font-bold uppercase tracking-wide ${tone}`}>{text}</span>
+                              </div>
+                              {e.crlf && (
+                                <p className="mt-0.5 text-[11px] text-amber-300">
+                                  Windows line endings: a shell on the server reads the extra \r as part of each line.
+                                </p>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                      {replaces && (
+                        <p className="text-[11px] text-zinc-500">
+                          A file it replaces is moved to ~/.submarine-trash on the server first and keeps its permissions.
+                        </p>
+                      )}
+                    </>
+                  )
+                )}
+              </div>
+
+              <div className="px-5 py-3.5 border-t border-white/5 flex items-center justify-end gap-2">
+                <button
+                  onClick={closeShellSync}
+                  disabled={shellSyncPushing}
+                  className="h-8 px-3 rounded-lg text-xs font-semibold text-zinc-300 hover:bg-white/5 transition-colors disabled:opacity-40"
+                >
+                  {shellSyncResult ? "Close" : "Cancel"}
+                </button>
+                {!shellSyncResult && (
+                  <button
+                    onClick={confirmShellSync}
+                    disabled={shellSyncBusy || pushes.length === 0}
+                    className="h-8 px-3 rounded-lg text-xs font-semibold bg-primary/10 text-primary hover:bg-primary/20 transition-colors disabled:opacity-40 disabled:pointer-events-none flex items-center gap-1.5"
+                  >
+                    {shellSyncPushing ? <Loader2 size={13} className="animate-spin" /> : <UploadCloud size={13} />}
+                    Push
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 

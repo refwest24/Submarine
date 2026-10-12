@@ -293,6 +293,17 @@ const DockerTab = ({ sessionId, disabled, onOpenContainerTerminal }: DockerTabPr
             <RefreshCw size={11} /> Refresh
           </button>
         ) : undefined}
+        select={{
+          value: tab,
+          options: [
+            { value: "containers", label: "Containers" },
+            { value: "resources", label: "Resources" },
+            { value: "compose", label: "Compose" },
+            { value: "prune", label: "Prune" },
+          ],
+          onChange: setTab,
+          label: "Docker view",
+        }}
       >
         <SubBtn active={tab === "containers"} onClick={() => setTab("containers")} icon={<ContainerIcon size={11} />}>Containers</SubBtn>
         <SubBtn active={tab === "resources"}  onClick={() => setTab("resources")}  icon={<Database size={11} />}>Resources</SubBtn>
@@ -1013,7 +1024,19 @@ const ContainerDetailsModal = ({
       </button>
     }>
       <div className="px-3 pt-2 pb-1 bg-black/20 border-b border-white/5 shrink-0">
-        <ScrollableTabs>
+        <ScrollableTabs
+          select={{
+            value: tab,
+            options: [
+              { value: "logs", label: "Logs" },
+              { value: "stats", label: "Stats" },
+              { value: "config", label: "Env · Mounts · Ports" },
+              { value: "inspect", label: "Inspect" },
+            ],
+            onChange: setTab,
+            label: "Container view",
+          }}
+        >
           <SubBtn active={tab === "logs"}    onClick={() => setTab("logs")}    icon={<FileText size={11} />}>Logs</SubBtn>
           <SubBtn active={tab === "stats"}   onClick={() => setTab("stats")}   icon={<Activity size={11} />}>Stats</SubBtn>
           <SubBtn active={tab === "config"}  onClick={() => setTab("config")}  icon={<Box size={11} />}>Env · Mounts · Ports</SubBtn>
@@ -1438,7 +1461,7 @@ const ModalShell = ({ title, onClose, actions, children }: { title: string; onCl
           {/* h-9 w-9 = 36 px touch target on phone, vs the old icon
               which was a 14 px icon with no padding zone — easy to miss
               with a thumb. */}
-          <button onClick={onClose} className="h-9 w-9 sm:h-7 sm:w-7 flex items-center justify-center rounded-md text-zinc-500 hover:text-white hover:bg-white/5">
+          <button aria-label="Close" onClick={onClose} className="h-9 w-9 sm:h-7 sm:w-7 flex items-center justify-center rounded-md text-zinc-500 hover:text-white hover:bg-white/5">
             <X size={16} />
           </button>
         </div>

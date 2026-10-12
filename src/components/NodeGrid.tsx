@@ -271,9 +271,11 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
 
         {/* Drag handle (grip) — grab to reorder. Hidden until hover on desktop,
             always shown on touch (no hover there). touch-action:none stops the
-            gesture from scrolling the list while dragging. */}
+            gesture from scrolling the list while dragging. Pointer only, so
+            not a Tab stop: from the keyboard it would do nothing. */}
         {canReorder && (
           <button
+            tabIndex={-1}
             onPointerDown={(e) => beginDrag(e, s.id)}
             onClick={(e) => e.stopPropagation()}
             title="Drag to reorder"
@@ -293,7 +295,11 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
 
         {/* Name + host — flex-1 + min-w-0 so long values truncate cleanly. */}
         <div className="min-w-0 flex-1">
-          <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{s.name}</h3>
+          {/* A button so the keyboard can open it too: its click bubbles to
+              the card's own handler. */}
+          <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">
+            <button type="button" className="max-w-full truncate text-left rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60">{s.name}</button>
+          </h3>
           <div className="flex items-center gap-1 mt-0.5">
             <Globe size={10} className="text-zinc-400 shrink-0" />
             <span className="text-[10.5px] text-zinc-300 font-mono truncate">{s.host}</span>
@@ -302,7 +308,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
 
         {/* Actions: absolute + hover-revealed on desktop so the name gets the
             full width; inline + always-visible on mobile (no hover there). */}
-        <div className="flex items-center gap-0.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 [@media(hover:none)]:!opacity-100 sm:absolute sm:right-1.5 sm:top-1/2 sm:-translate-y-1/2 sm:pl-8 sm:bg-gradient-to-l sm:from-[#121216] sm:via-[#121216] sm:to-transparent transition-all duration-200">
+        <div className="flex items-center gap-0.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 [@media(hover:none)]:!opacity-100 sm:absolute sm:right-1.5 sm:top-1/2 sm:-translate-y-1/2 sm:pl-8 sm:bg-gradient-to-l sm:from-[#121216] sm:via-[#121216] sm:to-transparent transition-all duration-200">
           {onCloneServer && (
             <button
               onClick={(e) => { e.stopPropagation(); onCloneServer(s.id); }}
@@ -374,7 +380,9 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
             />
           ) : (
             <>
-              <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{f.name}</h3>
+              <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">
+                <button type="button" className="max-w-full truncate text-left rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60">{f.name}</button>
+              </h3>
               <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-[0.12em]">
                 {serverCount === 1 ? '1 server' : `${serverCount} servers`}
               </span>
@@ -402,8 +410,8 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
           </div>
         ) : (
           <div className="relative flex items-center shrink-0">
-            <span className="text-[10px] bg-black/60 text-zinc-400 px-1.5 py-0.5 rounded-md font-mono group-hover:opacity-0 transition-opacity">{serverCount}</span>
-            <div className="absolute right-0 flex items-center gap-0.5 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 [@media(hover:none)]:!opacity-100 transition-all bg-gradient-to-l from-[#16161b] via-[#16161b] to-transparent pl-6">
+            <span className="text-[10px] bg-black/60 text-zinc-400 px-1.5 py-0.5 rounded-md font-mono group-hover:opacity-0 group-has-[:focus-visible]:opacity-0 transition-opacity">{serverCount}</span>
+            <div className="absolute right-0 flex items-center gap-0.5 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 [@media(hover:none)]:!opacity-100 transition-all bg-gradient-to-l from-[#16161b] via-[#16161b] to-transparent pl-6">
               <button
                 onClick={(e) => { e.stopPropagation(); setRenaming({ id: f.id, draft: f.name || "" }); }}
                 title="Rename folder"
@@ -448,7 +456,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
         {/* Header navigation if in folder */}
         {!isSearching && activeFolderId !== null && (
           <div className="flex items-center gap-3 mb-6">
-            <button
+            <button aria-label="Back to all servers"
               onClick={() => setActiveFolderId(null)}
               className="w-8 h-8 bg-black rounded-xl border border-white/5 flex items-center justify-center hover:bg-white/10 hover:text-white text-zinc-500 transition-all shadow-inner"
             >

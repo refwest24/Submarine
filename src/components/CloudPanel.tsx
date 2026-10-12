@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import InvitesSection from "./InvitesSection";
 import SyncStorageSection from "./SyncStorageSection";
+import SyncServerSetting, { CloudConfigView, hostOf } from "./SyncServerSetting";
 
 // Cloud account panel, opened from the profile picker. Owns its own auth state;
 // the parent just mounts/unmounts. Signed-out is split into intent-first flows
@@ -46,6 +47,8 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
   const [loginLinkToken, setLoginLinkToken] = useState("");
   const [signedInEmail, setSignedInEmail] = useState<string | null>(null);
 
+  const [serverView, setServerView] = useState<CloudConfigView | null>(null);
+
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
@@ -75,7 +78,25 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
     }
   }, []);
 
-  useEffect(() => { if (isOpen) refreshStatus(); }, [isOpen, refreshStatus]);
+  useEffect(() => {
+    if (!isOpen) return;
+    refreshStatus();
+    invoke<CloudConfigView>("cloud_get_config").then(setServerView).catch((e) => setError(String(e)));
+  }, [isOpen, refreshStatus]);
+
+  // Another server: signed out, and every half-done flow starts over. A claim
+  // or reset token from one server means nothing to the next, and a password
+  // typed for one must not be sent to the other.
+  const onServerChanged = (view: CloudConfigView, serverChanged: boolean) => {
+    setServerView(view);
+    if (serverChanged) {
+      resetForms();
+      setSignedInEmail(null);
+      setStage("chooser");
+      setInfo(`Sync server set to ${hostOf(view.server)}. Sign in or create an account there.`);
+    }
+    refreshStatus();
+  };
 
   // ---- Auth handlers ---------------------------------------------------
 
@@ -242,6 +263,13 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
     }
   };
 
+  // Which server the credentials on a step go to, when it is a self-hosted one.
+  const serverLine = serverView?.is_custom && (
+    <p className="text-[11px] text-zinc-500 -mt-1">
+      on <span className="font-mono text-zinc-300">{hostOf(serverView.server)}</span>
+    </p>
+  );
+
   const goBack = () => {
     setError(null); setInfo(null);
     setStage("chooser");
@@ -271,7 +299,7 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
               </span>
             )}
           </div>
-          <button onClick={onClose} className="text-zinc-400 hover:text-white"><X size={16} /></button>
+          <button aria-label="Close" onClick={onClose} className="text-zinc-400 hover:text-white"><X size={16} /></button>
         </div>
 
         <div className="flex-1 overflow-y-auto custom-scrollbar p-5 space-y-3">
@@ -279,13 +307,13 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
             <div className="px-3 py-2 bg-rose-500/15 border border-rose-500/30 rounded text-rose-200 text-[12px] flex items-start gap-2">
               <AlertTriangle size={13} className="mt-0.5 shrink-0" />
               <span className="flex-1 break-words whitespace-pre-line">{error}</span>
-              <button onClick={() => setError(null)} className="text-rose-300/70 hover:text-white mt-0.5"><X size={12} /></button>
+              <button aria-label="Dismiss" onClick={() => setError(null)} className="text-rose-300/70 hover:text-white mt-0.5"><X size={12} /></button>
             </div>
           )}
           {info && !error && (
             <div className="px-3 py-2 bg-emerald-500/10 border border-emerald-500/20 rounded text-emerald-100 text-[12px] flex items-center gap-2">
               <CheckCircle2 size={13} /> <span className="flex-1 break-words">{info}</span>
-              <button onClick={() => setInfo(null)} className="text-emerald-200/70 hover:text-white"><X size={12} /></button>
+              <button aria-label="Dismiss" onClick={() => setInfo(null)} className="text-emerald-200/70 hover:text-white"><X size={12} /></button>
             </div>
           )}
 
@@ -324,9 +352,10 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
           {stage === "sign-in" && (
             <div className="max-w-sm mx-auto py-4 space-y-3">
               <div className="flex items-center gap-2 pb-1">
-                <button onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
+                <button aria-label="Back" onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
                 <span className="text-[12.5px] font-bold uppercase tracking-wider text-zinc-300">Sign in</span>
               </div>
+              {serverLine}
               <input
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -370,9 +399,10 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
           {stage === "forgot-email" && (
             <div className="max-w-sm mx-auto py-4 space-y-3">
               <div className="flex items-center gap-2 pb-1">
-                <button onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
+                <button aria-label="Back" onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
                 <span className="text-[12.5px] font-bold uppercase tracking-wider text-zinc-300">Reset password</span>
               </div>
+              {serverLine}
               <p className="text-[11.5px] text-zinc-500 leading-relaxed">
                 Enter the email you signed up with. If it's registered, we'll send a reset token.
                 Your local vault and saved servers are not affected — only the cloud-sync password.
@@ -405,9 +435,10 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
           {stage === "forgot-reset" && (
             <div className="max-w-sm mx-auto py-4 space-y-3">
               <div className="flex items-center gap-2 pb-1">
-                <button onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
+                <button aria-label="Back" onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
                 <span className="text-[12.5px] font-bold uppercase tracking-wider text-zinc-300">New password</span>
               </div>
+              {serverLine}
               <p className="text-[12px] text-zinc-300">
                 Paste the reset token from your email, then set a new password.
               </p>
@@ -450,9 +481,10 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
           {stage === "link-email" && (
             <div className="max-w-sm mx-auto py-4 space-y-3">
               <div className="flex items-center gap-2 pb-1">
-                <button onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
+                <button aria-label="Back" onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
                 <span className="text-[12.5px] font-bold uppercase tracking-wider text-zinc-300">Sign in by email</span>
               </div>
+              {serverLine}
               <p className="text-[11.5px] text-zinc-500 leading-relaxed">
                 We'll email you a one-time sign-in code. No password needed this time —
                 your existing password stays as it is.
@@ -485,9 +517,10 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
           {stage === "link-verify" && (
             <div className="max-w-sm mx-auto py-4 space-y-3">
               <div className="flex items-center gap-2 pb-1">
-                <button onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
+                <button aria-label="Back" onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
                 <span className="text-[12.5px] font-bold uppercase tracking-wider text-zinc-300">Sign in by email</span>
               </div>
+              {serverLine}
               <p className="text-[12px] text-zinc-300">
                 Paste the sign-in token from the email.
               </p>
@@ -513,9 +546,10 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
           {stage === "sign-up-email" && (
             <div className="max-w-sm mx-auto py-4 space-y-3">
               <div className="flex items-center gap-2 pb-1">
-                <button onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
+                <button aria-label="Back" onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
                 <span className="text-[12.5px] font-bold uppercase tracking-wider text-zinc-300">Create account</span>
               </div>
+              {serverLine}
               <p className="text-[11.5px] text-zinc-500 leading-relaxed">
                 We'll email you a verification link. You then set a password from inside the app.
               </p>
@@ -541,9 +575,10 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
           {stage === "sign-up-verify" && (
             <div className="max-w-sm mx-auto py-4 space-y-3">
               <div className="flex items-center gap-2 pb-1">
-                <button onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
+                <button aria-label="Back" onClick={goBack} className="text-zinc-400 hover:text-white"><ArrowLeft size={14} /></button>
                 <span className="text-[12.5px] font-bold uppercase tracking-wider text-zinc-300">Verify email</span>
               </div>
+              {serverLine}
               <p className="text-[12px] text-zinc-300">
                 Paste the token from the email{email ? <> sent to <span className="font-mono text-primary">{email}</span></> : null}.
               </p>
@@ -568,6 +603,7 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
           {/* ----- Sign up: set password ----- */}
           {stage === "sign-up-password" && (
             <div className="max-w-sm mx-auto py-4 space-y-3">
+              {serverLine}
               <p className="text-[12px] text-zinc-300 flex items-center gap-1.5">
                 <KeyRound size={13} className="text-primary" /> Choose a password for{" "}
                 <span className="font-mono text-primary">{email}</span>.
@@ -622,6 +658,9 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
                 </button>
               </div>
             </div>
+          )}
+          {serverView && (
+            <SyncServerSetting view={serverView} signedIn={stage === "signed-in"} onChanged={onServerChanged} />
           )}
         </div>
       </div>

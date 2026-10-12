@@ -175,7 +175,7 @@ Pick a binary from the [latest release](https://github.com/sinaxhpm/submarine/re
 
 | OS | File |
 |---|---|
-| Windows 10 / 11 | `.exe` installer or `.msi` |
+| Windows 10 / 11 | `.exe` installer or `.msi`, or the [portable](#portable-mode-windows) `.zip` |
 | macOS (Apple Silicon, or Intel via Rosetta) | `.dmg` or `.app.zip` |
 | Debian / Ubuntu / Mint | `.deb` — `sudo apt install ./submarine_*.deb` |
 | Fedora / RHEL / openSUSE | `.rpm` — `sudo dnf install ./submarine-*.rpm` |
@@ -184,6 +184,19 @@ Pick a binary from the [latest release](https://github.com/sinaxhpm/submarine/re
 | Android 8.0+ | `.apk` — sideload, no Play Store required |
 
 > Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". On macOS you may need `xattr -d com.apple.quarantine /Applications/Submarine.app`. Android sideloading needs "Install unknown apps" enabled for the installer source.
+
+### Portable mode (Windows)
+
+Submarine can keep all of its data next to the executable instead of in your user profile — on a USB stick, say. Create an empty folder named `submarine-data` beside `submarine.exe` and start the app; the `-portable.zip` release asset is already laid out that way. Profiles, the cloud sign-in, the window position and the UI preferences then live in `submarine-data`, and **Settings → Maintenance** shows the folder in use.
+
+A first portable launch starts with no profiles. To carry existing data over, close Submarine and copy two things into `submarine-data`:
+
+- the contents of `%APPDATA%\com.submarine.app`, except `sync_device.json` — it identifies each install to cloud sync, and the portable copy creates its own;
+- the folder `%LOCALAPPDATA%\com.submarine.app\EBWebView`. It holds the app's settings, including **Auto-sync**. Without it Auto-sync starts out on, and the first profile you open is uploaded to your cloud — so if you skip this folder, turn Auto-sync off in Settings before opening a profile you keep only on this computer.
+
+`submarine-data` then holds your encrypted profiles and your cloud sign-in token, so keep it somewhere only you can read. The credentials file for [S3 sync](#sync-to-your-own-s3-bucket) stays where it is and isn't copied into `submarine-data`.
+
+Not portable: the Microsoft Edge WebView2 runtime (a Windows system component, preinstalled on Windows 11 and current Windows 10) and the short-lived temp files used while editing or dragging remote files. If `submarine-data` can't be written to, Submarine falls back to the usual per-user folders and says so in Settings. (A plain, non-packaged Linux build works the same way — it just doesn't ship a prebuilt zip.)
 
 ### Android
 
@@ -223,7 +236,7 @@ Your data is encrypted on your machine before anything leaves it. Submarine and 
 
 ## Sync to your own S3 bucket
 
-Personal profiles can sync through an S3-compatible bucket you control (Linode Object Storage, AWS S3, MinIO, Cloudflare R2, Backblaze B2) instead of Submarine Cloud. No Submarine account is needed. Shared profiles still sync through Submarine Cloud, because sharing needs the account (members, invites, sealed key grants). The choice is per install and made in the desktop apps; on Android there is no practical way to provide the credentials file yet.
+Personal profiles can sync through an S3-compatible bucket you control (Linode Object Storage, AWS S3, MinIO, Cloudflare R2, Backblaze B2) instead of the sync server (Submarine Cloud or your own). No account is needed, and a profile synced this way isn't tied to any sync server, so changing the server in the Cloud panel doesn't affect it. Shared profiles still sync through the sync server, because sharing needs the account (members, invites, sealed key grants). The choice is per install and made in the desktop apps; on Android there is no practical way to provide the credentials file yet.
 
 **1. Put the access key in an s3cmd-format file.** Submarine reads `~/.config/submarine-sync/s3cfg` by default; any path works, including an existing `~/.s3cfg`. Only the `[default]` section is read:
 
@@ -243,7 +256,7 @@ Keep comments on their own lines — text after a value is read as part of the v
 
 **2. Point Submarine at the bucket.** Open the Cloud panel (the cloud bar on the profile picker, or **Settings → Cloud Sync**), choose **S3 bucket** under *Profile sync storage*, and fill in the bucket and the folder inside it (default `submarine/sync`). **Endpoint and region** overrides the file's `host_base` and the detected region, and has the path-style switch (on by default, works with every provider). **Test connection** writes, reads, lists and deletes a small probe object, then **Save**. If the region is wrong the server says which one it wants and Submarine retries with it, so Ceph-based services such as Linode's work without setting one.
 
-**3. Repeat on each machine.** A new machine lists the profiles it finds in the bucket on the profile picker; unlock one with its password to restore it. After that, **Sync now** and auto-sync work exactly as with Submarine Cloud.
+**3. Repeat on each machine.** A new machine lists the profiles it finds in the bucket on the profile picker; unlock one with its password to restore it. After that, **Sync now** and auto-sync work exactly as with the sync server.
 
 **What's in the bucket.** Each profile gets its own folder:
 
@@ -255,7 +268,7 @@ Keep comments on their own lines — text after a value is read as part of the v
   meta.json                          {"name": "<profile name>"}
 ```
 
-Record bodies are the same ciphertext Submarine Cloud would store, and the data key is only usable with the profile password. The bucket does see the key names (record type, record id, edit timestamp), object sizes and upload times, and the profile's name (in `meta.json`, and as the folder name for older profiles).
+Record bodies are the same ciphertext the sync server would store, and the data key is only usable with the profile password. The bucket does see the key names (record type, record id, edit timestamp), object sizes and upload times, and the profile's name (in `meta.json`, and as the folder name for older profiles).
 
 **Conflicts.** Each record (a server, a credential, a tunnel…) syncs on its own, so edits to different records on different machines both survive. When two machines change the *same* record, the newer edit wins, ordered by a hybrid logical clock so wall-clock drift between machines can't reorder edits. Devices only ever add objects and never need locks, so any number of them can sync at once.
 
@@ -291,15 +304,15 @@ Smaller installer (around 10 MB vs ~100 MB for an Electron equivalent), lower RA
 
 ### Where are my profiles stored?
 
-In a single encrypted file under your OS app-data directory. Nothing in plaintext. Nothing in a global Keychain or registry hive.
+In a single encrypted file under your OS app-data directory — or in the `submarine-data` folder when you run in [portable mode](#portable-mode-windows). Nothing in plaintext. Nothing in a global Keychain or registry hive.
 
 ### Where are the logs?
 
-In `submarine.log` in your OS log folder: `~/Library/Logs/<app id>/` on macOS, `~/.local/share/<app id>/logs/` on Linux, `%LOCALAPPDATA%\<app id>\logs\` on Windows (**Settings → Activity Log** shows the exact path). It records what the Activity Log shows plus sync, storage, profile and connection events and errors, one line each with a UTC timestamp. It stays on your machine, is readable only by you, is capped at about 2 MB, and passwords, keys and tokens are kept out of it.
+In `submarine.log` in your OS log folder: `~/Library/Logs/<app id>/` on macOS, `~/.local/share/<app id>/logs/` on Linux, `%LOCALAPPDATA%\<app id>\logs\` on Windows, or `submarine-data\logs\` in [portable mode](#portable-mode-windows) (**Settings → Activity Log** shows the exact path). It records what the Activity Log shows plus sync, storage, profile and connection events and errors, one line each with a UTC timestamp. It stays on your machine, is readable only by you, is capped at about 2 MB, and passwords, keys and tokens are kept out of it.
 
 ### Does Submarine collect telemetry or analytics?
 
-No. There's no analytics SDK, no crash reporter that sends data home, no "phone home" call on launch. The only outbound network call beyond your SSH targets is the optional cloud-sync endpoint at `api.sinaxhpm.com` (or your own bucket, if you choose S3 sync storage), and that endpoint only ever receives opaque ciphertext.
+No. There's no analytics SDK and no crash reporter that sends data home. Beyond your SSH targets, Submarine talks to the sync server when you use cloud sync (`submarine.sinaxhpm.com` by default, or your own), to your own bucket if you choose S3 sync storage, and to GitHub's release API when the profile picker checks for a newer version. The sync server and the bucket only ever receive opaque ciphertext.
 
 ### Can I use Submarine on my Android phone with the same servers as my desktop?
 
@@ -311,7 +324,7 @@ No. Distribution is via sideloadable APK from the [releases page](https://github
 
 ## Build from Source
 
-Requirements: Node 20+, Rust stable, [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS. Windows additionally needs **Strawberry Perl** for the vendored OpenSSL build (`winget install StrawberryPerl.StrawberryPerl`).
+Requirements: Node 20+, Rust 1.90+, [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS. The SSH stack is pure Rust, so no OpenSSL or Perl is needed on any platform.
 
 ```bash
 git clone https://github.com/sinaxhpm/submarine
@@ -325,7 +338,7 @@ Tests: `cargo test --lib` in `src-tauri`, `npm run typecheck`, and the click-thr
 
 ### Android build
 
-Extra requirements: Android SDK + Platform-Tools, NDK 27, and JDK 17. `scripts/android-env.ps1` sets `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME` for the current PowerShell session.
+Extra requirements: Android SDK + Platform-Tools, NDK 27, and JDK 17. `scripts/android-env.ps1` sets `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME` for the current PowerShell session. It finds the SDK through `ANDROID_HOME` or `ANDROID_SDK_ROOT`, or in Android Studio's default folder (`%LOCALAPPDATA%\Android\Sdk`).
 
 ```powershell
 . .\scripts\android-env.ps1

@@ -51,34 +51,34 @@ Shared profiles stay on the HTTP cloud.
         then the manual tests with the log open
 - [x] 11. Resume E2E (step 6 error paths onward) on the rebuilt copies, then cleanup (re-run from scratch 2026-10-12)
 - [ ] 13. Bring in upstream `SinaXhpm/Submarine` main (`75678e5`, 77 commits past v0.3.8) — same PR (#1 on the fork)
-  - [ ] 13.1 Merge upstream main into this branch (merge, no rebase/force push); resolve the 8 conflicts
+  - [x] 13.1 Merge upstream main into this branch (merge, no rebase/force push); resolve the 8 conflicts
         (Cargo.toml/lock, lib.rs, tunnel.rs, CloudPanel, ProfilePanel, ProfileSelectPage, SettingsPanel)
-  - [ ] 13.2 Build fixes: `HttpTransport` carries upstream's `cloud::Session` (#121); `hmac` 0.13 (sha2 0.11);
+  - [x] 13.2 Build fixes: `HttpTransport` carries upstream's `cloud::Session` (#121); `hmac` 0.13 (sha2 0.11);
         keep `async-trait` as a direct dependency; take upstream's lock and let cargo add only edges
-  - [ ] 13.3 S3 without sign-in (decision 7, user 2026-10-12): personal profiles on S3 need no cloud session
+  - [x] 13.3 S3 without sign-in (decision 7, user 2026-10-12): personal profiles on S3 need no cloud session
         and skip upstream's per-profile server link (`check_profile_server` / `link_profile_server`, the
         "syncs elsewhere" warning, Move here); sync / restore / force push / stats / list / delete check the
         S3 settings and use S3. Shared profiles and the HTTP backend keep upstream's behaviour
-  - [ ] 13.4 Picker on upstream's redesign: one row identity (`row.key`) for selection, the ⋯ menu and React
+  - [x] 13.4 Picker on upstream's redesign: one row identity (`row.key`) for selection, the ⋯ menu and React
         keys; exact-name local ↔ cloud linking; storage-aware cloud bar; log-file calls inside upstream's
         error places; `cleanErr` strips `[S3]`
-  - [ ] 13.5 Names (decision 8, user 2026-10-12): refuse a new profile whose name matches an existing one in
+  - [x] 13.5 Names (decision 8, user 2026-10-12): refuse a new profile whose name matches an existing one in
         ANY letter case, on every platform — create / import (incl. upstream's Android `import_profile_bytes`)
         / restore / accept-invite, local and cloud names; replaces the 10-05 "allowed on Linux" rule
-  - [ ] 13.6 S3 client honours the Cloud panel's proxy choice (upstream turned on reqwest `system-proxy`)
-  - [ ] 13.7 Upstream's new `eprintln!`/`println!` lines through applog; `[SYNC] OTHER_SERVER` message
+  - [x] 13.6 S3 client honours the Cloud panel's proxy choice (upstream turned on reqwest `system-proxy`)
+  - [x] 13.7 Upstream's new `eprintln!`/`println!` lines through applog; `[SYNC] OTHER_SERVER` message
         without its code; README sentences made untrue by upstream (sync server wording, telemetry FAQ,
         portable log folder, s3cfg not carried by portable mode)
-  - [ ] 13.8 Tests: unit tests for the new name rule and the session-free S3 paths; `cargo test` (incl. live
+  - [x] 13.8 Tests: unit tests for the new name rule and the session-free S3 paths; `cargo test` (incl. live
         S3 ITs), typecheck, build; manual-test doc revised (names, sync without sign-in, picker ⋯ menu,
         proxy, self-hosted server coexistence, portable log location)
   - [ ] 13.9 Fast-forward the fork's `main` to upstream (`refwest24/Submarine` only), push this branch;
         PR #1 shows only this branch's changes
   - [ ] 13.10 User re-runs the key manual checks on fresh test copies
 
-Decision (9.3, user 2026-10-05): names that differ only in case are allowed where the disk is case-sensitive
-(Linux) and refused, with an explanation, where the disk ignores case (macOS/Windows defaults) — detected by
-probing the profiles folder, not by OS name.
+Decision (9.3, user 2026-10-05), **superseded 2026-10-12**: names that differ only in case were allowed where the
+disk is case-sensitive. Now (decision 8, step 13.5): a new name matching an existing profile in any letter case
+is refused on every platform; names are still kept and matched exactly as typed.
 
 ## Progress notes
 
@@ -141,18 +141,40 @@ probing the profiles folder, not by OS name.
     "bucket doesn't exist" message stays under the form after the bucket name is corrected; Settings shows
     the can't-read warning and a green "Saved — personal profiles now sync" together; the picker hides
     cloud profiles with no live items, so an empty profile never shows In cloud.
+- **Step 13 (2026-10-12): upstream merged in.** Upstream main `75678e5` (77 commits) merged into this branch
+  (merge commit, no rebase). Conflicts: Cargo.toml/lock (upstream's lock + 5 edges, no new crates; `hmac` 0.13
+  for sha2 0.11; `async-trait` kept as a direct dep), lib.rs (19 blocks, CRLF kept), tunnel.rs, and four UI
+  files. Sync: `HttpTransport` carries upstream's `cloud::Session`; `SyncTransport::server()` is the server a
+  transport is tied to (`None` for S3); `sync_with(…, session: Option<&Session>)` needs a sign-in only for a
+  shared profile or the HTTP backend, and runs upstream's `check_profile_server`/`link_profile_server` only
+  when there is a server (decision 7); restore / force push / stats / list / delete take the same route;
+  every sync is logged from `sync_with`. ProfilePanel hides upstream's "syncs with another server" warning
+  and Move button on S3. Picker: rebuilt on upstream's redesign (#123) with one row identity (`row.key`) for
+  selection, the ⋯ menu and React keys, exact-name linking, S3 cloud bar, log-file calls in upstream's error
+  places; import also refuses cloud names that differ only in case. Names (decision 8):
+  `ensure_profile_name_free` refuses any-case matches on every platform (also upstream's Android
+  `import_profile_bytes`). S3 client built by upstream's `cloud_config::build_client` (Cloud panel proxy; none
+  for a loopback endpoint). Upstream's new prints and the portable-mode decision go to the log; README
+  sentences fixed (sync server wording, telemetry FAQ incl. the GitHub update check, portable logs/s3cfg).
+  Verified: `cargo check --all-targets`; `cargo test --lib` 258 passed incl. the 3 live S3 ITs and 2 new tests
+  (`a_profile_name_taken_in_any_letter_case_is_refused`, `an_s3_transport_needs_no_sign_in_and_no_server`);
+  8 failed — all upstream `archive::tests::sh_runs::*` (#120), "Abort trap: 6" from macOS `tar`/`unzip`; the
+  same tests fail on pristine upstream `75678e5` too (9 of 12), so not caused by the merge. `npm ci` (upstream
+  moved to Vite 6), typecheck, build clean. Manual-test doc: tests 8 (names), 9 (bucket sync signed out),
+  10 (proxy, self-hosted server), 11 (picker rows/menu) new or rewritten; cleanup is now 12, acceptance 13.
 - **Step 8 (2026-10-05):** README gains "Sync to your own S3 bucket" (s3cfg format, setup, bucket layout, what
   the bucket can see, conflict rule, 30-day retention of losing edits), a feature bullet, and an S3 mention in
   the telemetry FAQ. `cloud.rs` header now describes record-level sync and points at `sync_backend.rs`.
   Written ahead of step 7, so re-check the setup steps against the GUI during E2E.
 
-## Resume here (2026-10-12)
+## Resume here (2026-10-12, after step 13)
 
-- **Everything is committed and pushed**, with a PR open for review. The two-copy E2E passed; the scratch
-  folder and both test copies' data are cleaned up.
-- **Next, in order:** design call on "Delete from cloud" vs. a device that still has the profile open (see
-  "Found in the re-run") → manual-tests §10 Mac + Linux acceptance → the tests not run yet (§7 concurrent
-  edits, §8.1 auto-capitalise with the macOS setting on, §8.5 same-name `dup`) → polish list.
+- **Upstream is merged into this branch** (PR #1 on the fork). Pushed together with the fork's `main`
+  fast-forwarded to upstream `75678e5`, so PR #1 shows only this branch's changes.
+- **Next, in order:** rebuild the two test copies (`docs/manual-tests.md` §0) → re-run the key manual tests
+  on the merged code: 1–3, 6, 8, 9, 10.1, 11, 12 → design call on "Delete from cloud" vs. a device that still
+  has the profile open → §13 Mac + Linux acceptance → not run yet: §7, §8.1, §8.6 → polish list.
+- Upstream's archive tests fail on macOS (see step 13 note) — report upstream or ignore; not this PR's.
 - Screenshots `Image1–9.png` in the repo root are untracked and show the bucket/host — never commit them.
 
 ## Step 7 — E2E checklist (resume here)
@@ -186,8 +208,8 @@ test-only password.
 - [x] Picker → "Delete from cloud" on `e2e` → `submarine/sync-test/` empty (only once A was quit — see "Found in the re-run")
 - [x] Cleanup: quit both, remove `~/Library/{Application Support,Caches,WebKit}/com.submarine.e2e.{a,b}` (ask user before deleting)
 
-Then user acceptance: release build on the Mac and the Linux machine pointed at `submarine/sync`, retire the
-old sync script (keep its old object in the bucket as a backup). Then finish the Review below.
+Then user acceptance (manual-tests §13): release build on the Mac and the Linux machine pointed at
+`submarine/sync`, retire the old sync script (keep its old object in the bucket as a backup).
 
 Re-run the Linode integration tests any time (throwaway `submarine-it/<id>/` prefix, self-cleaning):
 `SUBMARINE_S3_IT=1 SUBMARINE_S3_IT_CFG=$HOME/.config/submarine-sync/s3cfg SUBMARINE_S3_IT_BUCKET=<bucket> cargo test --lib it_`

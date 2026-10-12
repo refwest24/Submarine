@@ -2,34 +2,64 @@ import { useEffect, useMemo, useRef, useState, forwardRef, useImperativeHandle }
 import { createPortal } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { File as FileIcon, Download, Upload, AlertTriangle, Check, X, Ban, Folder, FolderUp, Rows, LayoutPanelTop } from "lucide-react";
+import { File as FileIcon, Download, Upload, AlertTriangle, Check, X, Ban, Folder, Rows, Columns, LayoutPanelTop, Shield, ShieldAlert, Trash2 } from "lucide-react";
 import FilePanel, { ActiveDrag, FilePanelHandle } from "./FilePanel";
 import MirrorsPanel from "./MirrorsPanel";
 import { createLocalProvider } from "../fs/localProvider";
 import { createRemoteProvider } from "../fs/remoteProvider";
-import { transferFile } from "../fs/transfer";
-import { useOverwritePrompt } from "../ui/confirm";
+import { useTextPrompt } from "../ui/confirm";
+import { useIsNarrow } from "../hooks/useViewport";
+import { bookmarksKey } from "../util/sftpBookmarks";
+
+// Root (sudo) mode for the remote pane — see `sftp_set_elevated` in lib.rs.
+type ElevationStatus = { elevated: boolean; passwordless: boolean };
+
+const SUDO_MESSAGES: Record<string, string> = {
+  "[SUDO] NEED_PASSWORD": "sudo needs a password.",
+  "[SUDO] WRONG_PASSWORD": "Wrong sudo password.",
+  "[SUDO] NOT_ALLOWED": "This user isn't allowed to run sftp-server with sudo.",
+  "[SUDO] REQUIRETTY": "sudo on this server requires a terminal (requiretty), so it can't be used for file access.",
+  "[SUDO] NO_SUDO": "sudo isn't installed on this server.",
+  "[SUDO] NO_SFTP_SERVER": "Couldn't find the sftp-server program on this server.",
+};
+
+const describeSudoError = (raw: string) => {
+  const code = Object.keys(SUDO_MESSAGES).find((k) => raw.includes(k));
+  return code ? SUDO_MESSAGES[code] : raw.replace(/^\[SUDO\] FAILED:?\s*/, "sudo failed: ");
+};
 
 // Dual-pane SFTP workspace. Owns the two FilePanels, the cross-pane drag
 // state, and the global mouseup that turns a release over the opposite pane
-// into a `transferFile` call. The panels themselves stay agnostic — they only
-// know how to drive their own provider.
+// into the source pane's own upload or download (FilePanelHandle.sendTo).
+
+export type SftpView = "files" | "mirror";
 
 interface SftpWorkspaceProps {
   sessionId: string;
   disabled?: boolean;
   // Mirror config from the parent session — both pieces are needed by the
-  // (now-nested) MirrorsPanel sub-tab. Passing them through here lets us
-  // collapse the previously-separate Mirror toolbar entry into one SFTP
-  // umbrella ("Files" vs "Mirror" sub-tabs), so the session toolbar has
-  // one fewer item to fit on phones.
+  // nested MirrorsPanel. Passing them through here keeps Mirror inside the
+  // SFTP tool instead of a separate toolbar entry, so the session toolbar
+  // has one fewer item to fit on phones.
   serverId?: number;
   mirrorsConfig?: any[];
+  // Files or Mirror. The switch is the Mirror button in the SFTP panel's
+  // title bar (SessionView), which leaves this panel all its height.
+  view?: SftpView;
+  // The unlocked profile: with the server id it keys the panes' bookmarks
+  // (util/sftpBookmarks). A server that isn't saved (Quick Connect) has none.
+  profile?: string | null;
 }
-
-type SftpView = "files" | "mirror";
-type FilesLayout = "tabs" | "split";
+// "split" is Local above Remote; the name predates "side" and stays because
+// it is what earlier versions saved.
+type FilesLayout = "tabs" | "split" | "side";
 type FilesSide = "local" | "remote";
+
+const LAYOUT_OPTIONS: { id: FilesLayout; title: string; Icon: typeof Rows }[] = [
+  { id: "tabs", title: "One panel at a time", Icon: LayoutPanelTop },
+  { id: "split", title: "Both panels, Local above Remote (drag-drop between them)", Icon: Rows },
+  { id: "side", title: "Both panels side by side (drag-drop between them)", Icon: Columns },
+];
 
 // Cursor-following drag ghost, isolated into its own component so that the
 // per-mousemove position updates re-render ONLY this tiny node — not the whole
@@ -61,29 +91,36 @@ const DragGhost = forwardRef<DragGhostHandle>((_props, ref) => {
       }}
       className="bg-[#0c0c0e]/95 border border-indigo-500/40 rounded-lg px-3 py-1.5 text-[11px] font-mono text-zinc-100 shadow-2xl backdrop-blur-md flex items-center gap-2"
     >
-      <FileIcon size={12} className="text-indigo-300 shrink-0" />
-      <span className="truncate max-w-[260px]">{drag.entry.name}</span>
+      {drag.entries.length === 1 && drag.entries[0].isDir
+        ? <Folder size={12} className="text-indigo-300 shrink-0" />
+        : <FileIcon size={12} className="text-indigo-300 shrink-0" />}
+      <span className="truncate max-w-[260px]">
+        {drag.entries.length === 1 ? drag.entries[0].name : `${drag.entries.length} items`}
+      </span>
     </div>,
     document.body
   );
 });
 DragGhost.displayName = "DragGhost";
 
-const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfig = [] }: SftpWorkspaceProps) => {
-  // Active sub-tab. Files is the default (the common workflow); Mirror is
-  // for the per-server one-way replication setup.
-  const [view, setView] = useState<SftpView>("files");
+const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfig = [], view = "files", profile }: SftpWorkspaceProps) => {
+  // Mirror needs a saved server; without one the files always show.
+  const shownView: SftpView = view === "mirror" && serverId ? "mirror" : "files";
   // Files layout: "tabs" (one side full height) is the default because the
   // side panel is narrow on most desktop setups and "split" squeezed each
-  // FilePanel into 5-6 rows. "split" stays available for users who want
-  // simultaneous Local+Remote visibility (drag-drop still works there).
+  // FilePanel into 5-6 rows. "split" and "side" stay available for users who
+  // want simultaneous Local+Remote visibility (drag-drop still works there).
   // Persisted globally (not per-session) — pure layout preference.
   const [layout, setLayout] = useState<FilesLayout>(() => {
     try {
       const v = localStorage.getItem("submarine-sftp-layout");
-      return v === "split" ? "split" : "tabs";
+      return v === "split" || v === "side" ? v : "tabs";
     } catch { return "tabs"; }
   });
+  // Two lists side by side don't fit a phone-width window: there "side" shows
+  // as "split", and the saved choice comes back once the window is wider.
+  const isNarrow = useIsNarrow();
+  const shownLayout: FilesLayout = layout === "side" && isNarrow ? "split" : layout;
   const setLayoutPersisted = (l: FilesLayout) => {
     setLayout(l);
     try { localStorage.setItem("submarine-sftp-layout", l); } catch { /* quota — ignore */ }
@@ -109,6 +146,121 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
   const localRef = useRef<FilePanelHandle | null>(null);
   const remoteRef = useRef<FilePanelHandle | null>(null);
 
+  // ---- Root (sudo) mode for the remote pane ---------------------------------
+  // Elevated = SFTP runs as root through sudo (passwordless or with a password
+  // kept in backend memory for this tab only). A direct root login is flagged
+  // with the same badge so it's always obvious when file ops have full power.
+  const textPrompt = useTextPrompt();
+  const [elevation, setElevation] = useState<ElevationStatus>({ elevated: false, passwordless: false });
+  const [loginUser, setLoginUser] = useState<string | null>(null);
+  const [elevBusy, setElevBusy] = useState(false);
+  const [elevError, setElevError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<ElevationStatus>("sftp_elevation_status", { sessionId })
+      .then((s) => { if (!cancelled) setElevation(s); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (disabled) return;
+    let cancelled = false;
+    invoke<string>("sftp_login_user", { sessionId })
+      .then((u) => { if (!cancelled) setLoginUser(u || null); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [sessionId, disabled]);
+
+  const flashElevError = (msg: string) => {
+    setElevError(msg);
+    window.setTimeout(() => setElevError(null), 6000);
+  };
+
+  const toggleElevation = async () => {
+    if (elevBusy || disabled) return;
+    setElevBusy(true);
+    setElevError(null);
+    try {
+      if (elevation.elevated) {
+        setElevation(await invoke<ElevationStatus>("sftp_set_elevated", { sessionId, enabled: false, password: null }));
+      } else {
+        // Passwordless sudo first; only ask for a password when sudo wants one.
+        let password: string | null = null;
+        for (let wrongTries = 0; ; ) {
+          try {
+            setElevation(await invoke<ElevationStatus>("sftp_set_elevated", { sessionId, enabled: true, password }));
+            break;
+          } catch (e: any) {
+            const raw = String(e);
+            const wrong = raw.includes("[SUDO] WRONG_PASSWORD");
+            if (!wrong && !raw.includes("[SUDO] NEED_PASSWORD")) throw e;
+            if (wrong && ++wrongTries >= 3) throw e;
+            password = await textPrompt({
+              title: "Run file operations as root",
+              message: wrong
+                ? "Wrong sudo password, try again."
+                : "Enter your sudo password. It's kept in memory for this tab only and never saved.",
+              password: true,
+              keepWhitespace: true,
+              okLabel: "Use sudo",
+              validate: (v) => (v ? null : "Enter the password"),
+            });
+            if (password === null) return;
+          }
+        }
+      }
+      await remoteRef.current?.refresh();
+    } catch (e: any) {
+      flashElevError(describeSudoError(String(e)));
+    } finally {
+      setElevBusy(false);
+    }
+  };
+
+  const rootByLogin = !elevation.elevated && loginUser === "root";
+  // The remote pane's header says how much room this control has (FilePanel
+  // sets `data-elev` on the pane): the icon alone, the word, or the word
+  // and how root was reached.
+  const elevWord = "group-data-[elev=icon]/pane:hidden";
+  const elevMore = "hidden group-data-[elev=full]/pane:inline";
+  const elevBox = "h-[22px] px-1.5 shrink-0 flex items-center gap-1 rounded-md text-[10px] uppercase tracking-wider border";
+  const rootBadgeClass = `${elevBox} font-black bg-rose-500/20 text-rose-200 border-rose-500/50`;
+  const elevationControl = elevation.elevated ? (
+    <button
+      onClick={toggleElevation}
+      disabled={elevBusy}
+      title={`File operations run as root via sudo${elevation.passwordless ? " (passwordless)" : ""}. Click to go back to ${loginUser || "your login user"}.`}
+      aria-label="root (sudo)"
+      className={`${rootBadgeClass} hover:bg-rose-500/30 disabled:opacity-50`}
+    >
+      <ShieldAlert size={11} className="shrink-0" />
+      <span className={elevWord}>root<span className={elevMore}> · sudo</span></span>
+    </button>
+  ) : rootByLogin ? (
+    <span title="Logged in as root: file operations run with full privileges." className={rootBadgeClass}>
+      <ShieldAlert size={11} className="shrink-0" />
+      <span className={elevWord}>root</span>
+    </span>
+  ) : (
+    <button
+      onClick={toggleElevation}
+      disabled={elevBusy || disabled}
+      title="Run file operations as root (sudo)"
+      aria-label="sudo"
+      className={`${elevBox} font-bold bg-white/[0.04] text-zinc-300 border-white/10 hover:bg-white/10 hover:text-white disabled:opacity-40`}
+    >
+      <Shield size={11} className={`shrink-0 ${elevBusy ? "animate-pulse" : ""}`} />
+      <span className={elevWord}>{elevBusy ? "…" : "sudo"}</span>
+    </button>
+  );
+  // Why sudo failed: a line of its own under the header's buttons, so the
+  // whole sentence shows and the buttons keep their places.
+  const elevationNote = elevError ? (
+    <div role="alert" className="px-1 text-[10px] leading-snug text-rose-300 break-words">{elevError}</div>
+  ) : null;
+
   // Persist the last directory each panel was in per (session, side) so the
   // user lands on the same path next time they open this server. If the
   // saved path no longer exists, FilePanel falls back to provider.homePath().
@@ -126,6 +278,9 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
     try { localStorage.setItem(storageKey, JSON.stringify(savedDirsRef.current)); }
     catch { /* quota or private-mode storage — ignore */ }
   };
+  // Where each pane keeps its bookmarks; none for a server that isn't saved.
+  const bookmarkKeyFor = (side: "local" | "remote") =>
+    profile && serverId > 0 ? bookmarksKey(profile, serverId, side) : undefined;
 
   // Source of truth for the active drag. Updated SYNCHRONOUSLY from the
   // panel's onMove via the ref so the window mouseup handler (which runs in
@@ -152,11 +307,13 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
 
   // Live transfer progress, keyed by the backend-assigned id. The Rust
   // commands stream events at ~10Hz; we replace the entry on each update so
-  // a single growing progress bar shows per transfer.
+  // a single growing progress bar shows per transfer. A folder delete that
+  // takes a while comes through here too (kind "delete"): for it `bytes` is
+  // the number of entries removed so far, and there is no total.
   interface Transfer {
     id: string;
     name: string;
-    kind: "upload" | "download";
+    kind: "upload" | "download" | "delete";
     bytes: number;
     total: number;
     status: "progress" | "done" | "error" | "cancelled";
@@ -173,7 +330,7 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
       if (t.status === "done" || t.status === "error" || t.status === "cancelled") {
         // Leave the final state visible briefly before clearing the card so
         // the user sees the success tick / failure colour / cancel notice.
-        const linger = t.status === "error" ? 6000 : t.status === "cancelled" ? 3000 : 1800;
+        const linger = t.status === "error" || t.error ? 6000 : t.status === "cancelled" ? 3000 : 1800;
         setTimeout(() => {
           setTransfers((prev) => {
             const { [t.id]: _, ...rest } = prev;
@@ -198,11 +355,15 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
     return `${(n / Math.pow(k, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
   };
 
-  const overwritePrompt = useOverwritePrompt();
+  // The workspace's own element: a drop counts only on its panes.
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
-  // Cross-pane drop dispatch: when the user releases the mouse anywhere, look
-  // up which pane is under the cursor; if it differs from the source pane,
-  // run the transfer and refresh both panels.
+  // Cross-pane drop: on a release over this workspace's other pane, the pane
+  // the drag came from sends what was dragged there with its own upload or
+  // download (folders, several items, the overwrite prompts), into the folder
+  // row under the pointer or else the folder that pane shows. The other pane
+  // then lists again (onTransferred). A release over a pane of another
+  // session's workspace (tabs side by side) is not this one's to handle.
   useEffect(() => {
     const onMouseUp = (e: MouseEvent) => {
       const active = dragRef.current;
@@ -211,117 +372,38 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
       // listener clearing the ghost) doesn't re-enter this branch.
       dragRef.current = null;
 
-      const hit = document.elementFromPoint(e.clientX, e.clientY);
-      if (!hit) return;
-      const pane = (hit as HTMLElement).closest("[data-fs-pane]") as HTMLElement | null;
-      if (!pane) return;
+      const hit = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+      const pane = hit?.closest("[data-fs-pane]") as HTMLElement | null;
+      if (!pane || !rootRef.current?.contains(pane)) return;
       const targetPaneId = pane.getAttribute("data-fs-pane");
       if (!targetPaneId || targetPaneId === active.paneId) return;
 
-      // Row-aware drop: if the cursor is on a folder row inside the
-      // destination pane, drop INTO that folder (its path) instead of
-      // the pane's current directory. Falling on a file row, an empty
-      // area, or the header still falls back to the pane's currentPath.
-      // This makes the natural "drag onto folder" gesture work, matching
-      // how users expect Finder/Explorer drag-drop to behave.
-      const row = (hit as HTMLElement).closest("[data-fs-row-isdir]") as HTMLElement | null;
-      const rowIsDir = row?.getAttribute("data-fs-row-isdir") === "1";
-      const rowPath = rowIsDir ? row?.getAttribute("data-fs-row-path") : null;
+      // Dropped on a folder row: into that folder, as in Finder or Explorer.
+      const row = hit?.closest("[data-fs-row-isdir]") as HTMLElement | null;
+      const rowPath = row?.getAttribute("data-fs-row-isdir") === "1" ? row.getAttribute("data-fs-row-path") : null;
       const targetDir = rowPath || pane.getAttribute("data-fs-current-path") || "";
       if (!targetDir) return;
 
-      const srcProv = active.paneId === "local" ? localProvider : remoteProvider;
-      const destProv = targetPaneId === "local" ? localProvider : remoteProvider;
-      const isCrossSide = (active.paneId === "local") !== (targetPaneId === "local");
-
-      const action = active.paneId === "local" && targetPaneId === "remote"
-        ? "Uploading"
-        : active.paneId === "remote" && targetPaneId === "local"
-          ? "Downloading"
-          : "Moving";
-      notify(`${action} ${active.entry.name}…`, "info");
-
-      const runTransfer = async () => {
-        const srcInfo = { provider: srcProv, path: active.entry.path, name: active.entry.name, isDir: active.entry.isDir };
-        const dstInfo = { provider: destProv, dir: targetDir };
-        try {
-          await transferFile(srcInfo, dstInfo, false);
-        } catch (err: any) {
-          const msg = String(err?.message ?? err);
-          // The backend emits `EXISTS:<path>` only for cross-side SFTP
-          // transfers; same-side rename surfaces its own per-provider
-          // errors that won't match this sentinel. Both paths therefore
-          // do the right thing.
-          if (!msg.startsWith("EXISTS:") || !isCrossSide || active.entry.isDir) throw err;
-          const direction = action === "Uploading" ? "upload" : "download";
-          const choice = await overwritePrompt({ name: active.entry.name, direction, batchSize: 1 });
-          if (choice === "cancel" || choice === "skip" || choice === "skip-all") {
-            notify(`${active.entry.name} skipped`, "info");
-            return;
-          }
-          await transferFile(srcInfo, dstInfo, true);
-        }
-        notify(`${active.entry.name} ✓`, "success");
-        // Refresh both sides — source may have lost the file (move semantics
-        // for same-side transfers), target gains it.
-        localRef.current?.refresh();
-        remoteRef.current?.refresh();
-      };
-
-      runTransfer().catch((err) => {
-        notify(`Transfer failed: ${err}`, "error");
-        console.error("Cross-pane transfer failed:", err);
-      });
+      const source = active.paneId === "local" ? localRef.current : remoteRef.current;
+      source?.sendTo(active.entries, targetDir).catch((err) => notify(`Transfer failed: ${err}`, "error"));
     };
     window.addEventListener("mouseup", onMouseUp);
     return () => window.removeEventListener("mouseup", onMouseUp);
-  }, [localProvider, remoteProvider, overwritePrompt]);
+  }, []);
 
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#0a0a0c] relative">
-      {/* Sub-tab strip — Files vs Mirror, replacing the standalone Mirror
-          toolbar button that used to live next to SFTP / Ports / Library. The
-          Mirror panel keeps state across tab switches via CSS hidden (same
-          mounted-but-invisible pattern the parent SessionView used before)
-          so the live worker's counters and rolling log survive a switch back
-          to Files. */}
-      <div className="shrink-0 grid grid-cols-2 border-b border-white/5 bg-black/20">
-        <button
-          onClick={() => setView("files")}
-          className={`h-9 flex items-center justify-center gap-1.5 text-[11px] font-bold uppercase tracking-wider transition-all ${
-            view === "files"
-              ? "text-primary bg-primary/5 border-b border-primary"
-              : "text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.03] border-b border-transparent"
-          }`}
-        >
-          <Folder size={12} /> Files
-        </button>
-        <button
-          onClick={() => setView("mirror")}
-          disabled={!serverId}
-          title={!serverId ? "Mirror needs a saved server" : undefined}
-          className={`h-9 flex items-center justify-center gap-1.5 text-[11px] font-bold uppercase tracking-wider transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
-            view === "mirror"
-              ? "text-primary bg-primary/5 border-b border-primary"
-              : "text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.03] border-b border-transparent"
-          }`}
-        >
-          <FolderUp size={12} /> Mirror
-        </button>
-      </div>
-
+    <div ref={rootRef} className="flex-1 flex flex-col h-full overflow-hidden bg-[#0a0a0c] relative">
       {/* Files view — dual-pane browser. Stays mounted when Mirror is on top
           so directory state and selection don't reset across tab toggles.
           Both FilePanels are ALWAYS mounted (one is just CSS-hidden in
           tabs mode) so cd state, scroll position, and selection survive a
           tab toggle. */}
-      <div className={`${view === "files" ? "flex-1 flex flex-col min-h-0" : "hidden"}`}>
+      <div className={`${shownView === "files" ? "flex-1 flex flex-col min-h-0" : "hidden"}`}>
         {/* Layout toolbar: Local|Remote pills in tabs mode (or a static
-            label in split mode), plus the global layout toggle on the
-            right. The toggle's label is the DESTINATION mode so the
-            user can predict what clicking will do. */}
+            label when both panels show), plus the global layout picker on
+            the right. */}
         <div className="shrink-0 h-10 sm:h-8 flex items-stretch border-b border-white/5 bg-black/20">
-          {layout === "tabs" ? (
+          {shownLayout === "tabs" ? (
             <div className="flex-1 grid grid-cols-2">
               <button
                 onClick={() => setActiveSidePersisted("local")}
@@ -349,64 +431,87 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
               Local + Remote
             </div>
           )}
-          <button
-            onClick={() => setLayoutPersisted(layout === "tabs" ? "split" : "tabs")}
-            title={layout === "tabs" ? "Show both panels stacked (drag-drop between them)" : "Switch to tabbed view (one panel at full height)"}
-            className="px-3 border-l border-white/5 text-[10px] font-bold uppercase tracking-wider text-zinc-400 hover:bg-white/5 hover:text-white flex items-center gap-1.5 transition-all shrink-0"
-          >
-            {layout === "tabs"
-              ? <><Rows size={11} /> Split</>
-              : <><LayoutPanelTop size={11} /> Tabs</>
-            }
-          </button>
+          <div role="group" aria-label="Files layout" className="flex items-stretch border-l border-white/5 shrink-0">
+            {LAYOUT_OPTIONS.filter((o) => o.id !== "side" || !isNarrow).map(({ id, title, Icon }) => (
+              <button
+                key={id}
+                onClick={() => setLayoutPersisted(id)}
+                title={title}
+                aria-pressed={shownLayout === id}
+                className={`w-9 sm:w-7 flex items-center justify-center transition-all ${
+                  shownLayout === id
+                    ? "text-primary bg-primary/10"
+                    : "text-zinc-500 hover:bg-white/5 hover:text-white"
+                }`}
+              >
+                <Icon size={12} />
+              </button>
+            ))}
+          </div>
         </div>
 
-        {/* Local panel — visible in split mode (top), or in tabs mode when
-            Local is the active side. Hidden via CSS (not unmounted) when
-            on the inactive tab so its directory and provider state
-            survive a side-swap. */}
-        <div className={
-          layout === "split"
-            ? "flex-1 min-h-0 border-b border-white/10"
-            : activeSide === "local" ? "flex-1 min-h-0" : "hidden"
-        }>
-          <FilePanel
-            ref={localRef}
-            provider={localProvider}
-            // The local pane also needs sessionId so its bulk-upload button can
-            // invoke sftp_upload_file / sftp_upload_dir on the right session.
-            // Without this the Upload button silently no-ops on the first
-            // guard (`if (!sessionId) return`).
-            sessionId={sessionId}
-            disabled={disabled}
-            onDragMove={handleDragMove}
-            initialPath={savedDirsRef.current.local}
-            onPathChange={(p) => saveDir("local", p)}
-            getOppositeDir={() => remoteRef.current?.currentDir()}
-          />
-        </div>
-        <div className={
-          layout === "split"
-            ? "flex-1 min-h-0"
-            : activeSide === "remote" ? "flex-1 min-h-0" : "hidden"
-        }>
-          <FilePanel
-            ref={remoteRef}
-            provider={remoteProvider}
-            sessionId={sessionId}
-            disabled={disabled}
-            onDragMove={handleDragMove}
-            initialPath={savedDirsRef.current.remote}
-            onPathChange={(p) => saveDir("remote", p)}
-            getOppositeDir={() => localRef.current?.currentDir()}
-          />
+        {/* Both panels share one box: a column for tabs and split, a row
+            for side by side. */}
+        <div className={`flex-1 min-h-0 flex ${shownLayout === "side" ? "flex-row" : "flex-col"}`}>
+          {/* Local panel — visible in split mode (top), side mode (left), or
+              in tabs mode when Local is the active side. Hidden via CSS (not
+              unmounted) when on the inactive tab so its directory and
+              provider state survive a side-swap. */}
+          <div className={
+            shownLayout === "split"
+              ? "flex-1 min-h-0 border-b border-white/10"
+              : shownLayout === "side"
+                ? "flex-1 min-w-0 min-h-0 border-r border-white/10"
+                : activeSide === "local" ? "flex-1 min-h-0" : "hidden"
+          }>
+            <FilePanel
+              ref={localRef}
+              provider={localProvider}
+              // The local pane also needs sessionId so its bulk-upload button can
+              // invoke sftp_upload_file / sftp_upload_dir on the right session.
+              // Without this the Upload button silently no-ops on the first
+              // guard (`if (!sessionId) return`).
+              sessionId={sessionId}
+              disabled={disabled}
+              onDragMove={handleDragMove}
+              initialPath={savedDirsRef.current.local}
+              onPathChange={(p) => saveDir("local", p)}
+              getOppositeDir={() => remoteRef.current?.currentDir()}
+              onTransferred={() => remoteRef.current?.refresh()}
+              bookmarksKey={bookmarkKeyFor("local")}
+            />
+          </div>
+          <div className={
+            shownLayout === "split"
+              ? "flex-1 min-h-0"
+              : shownLayout === "side"
+                ? "flex-1 min-w-0 min-h-0"
+                : activeSide === "remote" ? "flex-1 min-h-0" : "hidden"
+          }>
+            <FilePanel
+              ref={remoteRef}
+              provider={remoteProvider}
+              sessionId={sessionId}
+              disabled={disabled}
+              onDragMove={handleDragMove}
+              initialPath={savedDirsRef.current.remote}
+              onPathChange={(p) => saveDir("remote", p)}
+              getOppositeDir={() => localRef.current?.currentDir()}
+              onTransferred={() => localRef.current?.refresh()}
+              bookmarksKey={bookmarkKeyFor("remote")}
+              headerExtra={elevationControl}
+              headerNote={elevationNote}
+              rootMode={elevation.elevated || rootByLogin}
+              archiveOff={elevation.elevated ? "Archive and extract aren't available in root mode: they run as the login user, not through sudo" : undefined}
+            />
+          </div>
         </div>
       </div>
 
       {/* Mirror view — kept MOUNTED (CSS hidden) so the live worker's logs
           and progress counters survive when the user pops back to Files. */}
       {!!serverId && (
-        <div className={`${view === "mirror" ? "flex-1 flex flex-col min-h-0" : "hidden"}`}>
+        <div className={`${shownView === "mirror" ? "flex-1 flex flex-col min-h-0" : "hidden"}`}>
           <MirrorsPanel
             sessionId={sessionId}
             serverId={serverId}
@@ -416,19 +521,21 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
         </div>
       )}
 
-      {notification && (
-        <div className={`absolute bottom-3 left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-lg border text-[11px] font-mono shadow-2xl backdrop-blur-md animate-in fade-in slide-in-from-bottom-4 duration-300 ${
-          notification.type === "success" ? "bg-emerald-950/90 border-emerald-500/30 text-emerald-400" :
-          notification.type === "error"   ? "bg-rose-950/90 border-rose-500/30 text-rose-400" :
-                                            "bg-indigo-950/90 border-indigo-500/30 text-indigo-400"
-        }`}>{notification.msg}</div>
-      )}
-
-      {/* Live transfer cards — one growing progress bar per active SFTP
-          upload/download. Stacked bottom-right, fade out shortly after the
-          transfer completes. */}
-      {Object.values(transfers).length > 0 && (
-        <div className="absolute bottom-3 right-3 z-50 flex flex-col gap-1.5 max-w-[280px]">
+      {/* Notices along the bottom of the workspace: the toast, then the live
+          transfer cards (one growing progress bar per active upload or
+          download; a card fades out shortly after its transfer ends). The
+          stack spans the workspace, so nothing in it can be wider than a
+          narrow panel and end up cut off at the panel's edge. Clicks go
+          through it everywhere but on a card. */}
+      {(notification || Object.values(transfers).length > 0) && (
+        <div className="absolute bottom-3 inset-x-3 z-50 flex flex-col items-end gap-1.5 pointer-events-none">
+          {notification && (
+            <div className={`self-center max-w-full px-3 py-1.5 rounded-lg border text-[11px] font-mono [overflow-wrap:anywhere] shadow-2xl backdrop-blur-md animate-in fade-in slide-in-from-bottom-4 duration-300 ${
+              notification.type === "success" ? "bg-emerald-950/90 border-emerald-500/30 text-emerald-400" :
+              notification.type === "error"   ? "bg-rose-950/90 border-rose-500/30 text-rose-400" :
+                                                "bg-indigo-950/90 border-indigo-500/30 text-indigo-400"
+            }`}>{notification.msg}</div>
+          )}
           {Object.values(transfers).map((t) => {
             const pct = t.total > 0 ? Math.min(100, Math.round((t.bytes * 100) / t.total)) : 0;
             const tone =
@@ -446,14 +553,16 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
               t.status === "done"      ? Check :
               t.status === "cancelled" ? Ban :
               t.kind   === "upload"    ? Upload :
+              t.kind   === "delete"    ? Trash2 :
                                          Download;
             const statusLabel =
               t.status === "error"     ? "failed"
               : t.status === "cancelled" ? "cancelled"
+              : t.kind === "delete"      ? `${t.bytes.toLocaleString()} removed`
               : t.total > 0              ? `${pct}%`
                                          : formatBytes(t.bytes);
             return (
-              <div key={t.id} className={`px-2.5 py-1.5 rounded border ${tone} font-mono text-[10.5px] shadow-2xl backdrop-blur-md animate-in fade-in slide-in-from-right-4`}>
+              <div key={t.id} className={`w-full max-w-[280px] pointer-events-auto px-2.5 py-1.5 rounded border ${tone} font-mono text-[10.5px] shadow-2xl backdrop-blur-md animate-in fade-in slide-in-from-right-4`}>
                 <div className="flex items-center gap-1.5 mb-1">
                   <Icon size={11} className="shrink-0" />
                   <span className="truncate flex-1" title={t.name}>{t.name}</span>
@@ -474,13 +583,21 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
                 {t.status !== "error" && (
                   <div className="h-1 bg-white/10 rounded overflow-hidden">
                     <div
-                      className={`h-full ${barTone} transition-[width] duration-150`}
+                      className={`h-full ${barTone} transition-[width] duration-150 ${t.kind === "delete" && t.status === "progress" ? "animate-pulse" : ""}`}
                       style={{ width: t.total > 0 ? `${pct}%` : "100%" }}
                     />
                   </div>
                 )}
+                {/* Why it failed: up to three lines, so the reason can be
+                    read without hovering; the tooltip has all of it. */}
                 {t.status === "error" && t.error && (
-                  <div className="text-[9.5px] opacity-80 truncate" title={t.error}>{t.error}</div>
+                  <div className="text-[9.5px] opacity-80 line-clamp-3 [overflow-wrap:anywhere]" title={t.error}>{t.error}</div>
+                )}
+                {/* A finished folder download can carry a note, e.g. names
+                    this computer can't store were skipped; a cancelled
+                    upload says what it left on the server. */}
+                {(t.status === "done" || t.status === "cancelled") && t.error && (
+                  <div className="text-[9.5px] text-amber-300/90 line-clamp-3 [overflow-wrap:anywhere]" title={t.error}>{t.error}</div>
                 )}
               </div>
             );

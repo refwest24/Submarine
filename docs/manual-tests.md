@@ -1,7 +1,7 @@
 # Manual tests
 
-Click-through checks for profile sync, S3 storage and profile names — the parts the automated tests can't
-reach (the real app, the real bucket, two devices). Run them before merging changes to sync, storage or the
+Click-through checks for profile sync, S3 storage, the sync server settings and the profile picker — the
+parts the automated tests can't reach (the real app, the real bucket, two devices). Run them before merging changes to sync, storage or the
 profile picker, and before a release.
 
 Placeholders: `<bucket>` is your bucket, `<folder>` a **scratch** folder in it (for example
@@ -20,16 +20,21 @@ PATH="$HOME/.cargo/bin:$PATH" cargo test --lib            # offline unit tests, 
 SUBMARINE_S3_IT=1 SUBMARINE_S3_IT_CFG=<cfg> SUBMARINE_S3_IT_BUCKET=<bucket> \
   PATH="$HOME/.cargo/bin:$PATH" cargo test --lib it_
 
-cd .. && npm run typecheck && npm run build
+cd .. && npm ci && npm run typecheck && npm run build     # npm ci after pulling new dependencies
 ```
 
 - Without `SUBMARINE_S3_IT=1` the three live tests (`it_store_…`, `it_connection_test_…`,
   `it_two_devices_converge_…`) return early and still print `ok` — check they took seconds, not
   milliseconds. The `it_` filter also matches two offline tests (`edit_…`), so it reports 5.
-- `profile_names_are_case_sensitive_where_the_disk_allows` checks whichever kind of disk the temp folder is on.
-  To cover the other kind on a Mac, run it on a case-sensitive disk image:
+- `a_profile_name_taken_in_any_letter_case_is_refused` checks the name rule (test 8) on whatever disk the temp
+  folder is on; on a case-sensitive one it also checks that an exact name wins over a case variant left from
+  before the rule. To run that part on a Mac, use a case-sensitive disk image:
   `hdiutil create -size 20m -fs "Case-sensitive APFS" -volname subcs cs.dmg`, `hdiutil attach cs.dmg`, then
-  `TMPDIR=/Volumes/subcs/ cargo test --lib profile_names`, then `hdiutil detach /Volumes/subcs`.
+  `TMPDIR=/Volumes/subcs/ cargo test --lib a_profile_name`, then `hdiutil detach /Volumes/subcs`.
+- `an_s3_transport_needs_no_sign_in_and_no_server` checks that bucket sync needs no sync-server account and
+  isn't tied to a server (test 9 checks it in the app).
+- Known on macOS: 8–9 of upstream's archive tests (`archive::tests::sh_runs::…`) fail with "Abort trap: 6"
+  from the system `tar`/`unzip`, on upstream's own code too. Not related to sync; see "Known open issues".
 
 ### Two "devices" on one machine
 
@@ -59,7 +64,8 @@ tail -f ~/Library/Logs/com.submarine.e2e.a/submarine.log
 ```
 
 Lines look like `2026-10-05T23:59:59.123Z WARN  [S3] retrying after: …`. Areas: `APP`, `SYNC`, `S3`, `PROFILE`,
-`PICKER`, `ACTIVITY` (everything the Activity Log shows), `SSH`, `SFTP`, `TUNNEL`, `MONITOR`, `SHARE`.
+`PICKER`, `ACTIVITY` (everything the Activity Log shows), `SSH`, `SFTP`, `TUNNEL`, `MONITOR`, `SHARE`, `DATABASE`.
+In portable mode the file is in `submarine-data/logs/`, and the first lines after `APP … started` say so.
 
 **Secrets check — after every run, this must print nothing:**
 
@@ -78,7 +84,8 @@ and neither should a grep for the test profile passwords, the bucket's access ke
 | node | a **server** — **Servers** tab |
 | `credential_id` link | server editor → **How to log in** → **Use a saved login** → **Saved login** |
 | edit / clone / delete a server | hover the server row: **Clone**, **pencil (Edit)**, **trash (Delete)** appear at the right end |
-| sync backend | **Profile sync storage** (cloud bar on the profile picker, or **Settings → Cloud Sync**) |
+| sync backend | **Profile sync storage**, tabs **Sync server** / **S3 bucket** (profile picker → **Connect cloud sync** / **Manage**, or **Settings → Cloud Sync**) |
+| `cloud_config` (server, proxy) | Cloud panel → **Sync server** (Submarine Cloud or your own) and its **Proxy** choice |
 | activity log | **Settings → Activity Log → View Activity Log** |
 
 ### Looking inside the bucket
@@ -94,13 +101,16 @@ to get `<unix-ms>:<counter>:<device-id>`; each copy's device id is `node_id` in 
 
 ## 1. Storage setup
 
-On A: profile picker → cloud bar → **S3 bucket** tab. Credentials file `<cfg>`, Bucket `<bucket>`, Folder
+Both copies start **signed out** of any sync server: bucket sync needs no account (test 9 checks that).
+
+On A: profile picker → **Connect cloud sync** (signed out) or the cloud bar's **Manage** → **S3 bucket** tab. Credentials file `<cfg>`, Bucket `<bucket>`, Folder
 `<folder>` → **Test connection** → **Save**.
 
 - **Expect:** "Connected to bucket '<bucket>' at <endpoint> (region …) — write, read, list and delete all
   work." The region is whichever the server accepted (Linode may take `us-east-1` or ask for `default`).
   **Keys found** shows the endpoint. After Save: "Saved — personal profiles now sync through your bucket.";
-  the picker's cloud bar shows `<bucket>/<folder>` with an **S3** badge.
+  the picker's cloud bar shows `<bucket>/<folder>` and **S3 bucket** (**S3 bucket · Needs setup** while the
+  credentials file can't be read).
 - **Check:** the bucket folder is still empty (the test object was removed); A's `sync_backend.json` holds
   bucket, folder and file path only — no keys.
 - **Log:** `INFO [S3] connection test OK: Connected to bucket …`, then `INFO [S3] sync storage set to bucket
@@ -121,13 +131,13 @@ On A: **New profile** (type the name in lower case, e.g. `e2e`) → add a server
 
 ## 3. Restore on a second device
 
-On B: same storage setup as test 1. The picker lists A's profile with an **In cloud** badge (**Refresh from
-cloud** if not).
+On B: same storage setup as test 1. The picker lists A's profile as **In your cloud · N items** (**Refresh
+from cloud** if not).
 
 1. Select it → **Get on this device** → a **wrong** password. **Expect:** a wrong-password message
    (currently `ESCROW_UNSEAL_FAILED: wrong password for this profile`), not a network error.
-2. Again with the right password. **Expect:** `"<name>" is now on this device — pulled N items…`; badge
-   **Synced**.
+2. Again with the right password. **Expect:** `"<name>" is now on this device — pulled N items…`; the row
+   reads **On this device · Synced**.
 3. Open it. **Expect:** same servers and saved logins as A; the server's editor still says **Use a saved
    login** with the same login picked; connecting works if the server is real.
 4. Back on the picker, a wrong password on the now-local copy says "Wrong password."
@@ -170,41 +180,89 @@ Use **Settings → Cloud Sync → Profile sync storage** on one device.
 Edit the same server differently on A and on B **without syncing in between**. Sync A, then B, then A.
 **Expect:** both show the edit made last. **Bucket:** both versions exist; the older one is kept for 30 days.
 
-## 8. Profile names are case-sensitive
+## 8. Profile names
 
-Profile names keep exactly what was typed and are matched exactly: `e2e` and `E2e` are two profiles. A disk
-that ignores case (macOS and Windows by default) can't hold both files, so there the second is refused.
+Names keep exactly what was typed, and the picker links a local profile to a cloud one only by the exact name.
+But a **new** name that matches an existing profile in **any letter case** — on this device or in the cloud —
+is refused on every platform: `e2e` and `E2e` can't both be created.
 
 1. **No auto-capitalisation:** with macOS *Capitalize words automatically* on (System Settings → Keyboard →
    Text Input), type `lowercase` into **New profile** and into the name box of **Import**. **Expect:** it stays
    lower case, and `meta.json` in the bucket matches.
-2. **Case-only clash on macOS/Windows:** with `e2e` on the device, create `E2e`. **Expect:** "Can't use 'E2e'
-   here: this device's disk ignores letter case, so it would be the same file as your profile 'e2e'. Pick
-   another name." Same for **Import** under that name and for **Get on this device** of a cloud profile
-   named `E2e`. **Log:** `WARN [PROFILE] Can't use 'E2e' here: …` for each refusal.
-3. **Separate rows:** device B has local `E2e`; the bucket has `e2e` (from A) and `E2e` (from B). **Expect:**
-   two rows — `E2e` **Synced** and `e2e` **In cloud** — never merged.
-   Give each test profile at least one server first: the picker hides cloud profiles with no live items, so
-   an empty `E2e` stays **This device** even after it syncs, and an empty `e2e` never shows as **In cloud**.
-4. **Delete from cloud hits only its own profile:** on that `e2e` **In cloud** row → **Delete** →
-   confirm. **Bucket:** only A's `e2e` folder is gone; B's `E2e` folder is untouched.
-5. **Same exact name from two devices:** create `dup` independently on A and on B (don't restore), sync
-   both. **Expect** on A: local `dup` shows **This device** (not linked — the picker can't tell which cloud copy
-   is its own), plus two `dup` **In cloud** rows. **Get** on either says it already exists; **Delete** on one
-   removes only that folder (check the bucket).
-6. **Linux (case-sensitive disk):** create `e2e` and `E2e` on one machine. **Expect:** both allowed, both sync,
-   both listed in a stable order, each opens its own data.
+2. **Refused while typing:** with `e2e` on the device, type `E2e` into **New profile**. **Expect:** under the
+   name, `There's already a profile named "e2e".`, and the profile isn't created. With `e2e` only in the
+   cloud (an **In your cloud** row), typing `E2e`: `"e2e" is in your cloud. Get it from the list, or pick another
+   name.` **Import** under `E2e` is refused the same ways; importing under the exact cloud name `e2e` is
+   allowed (it may be that very profile).
+3. **Refused on restore:** **Get on this device** of a cloud profile `e2e` while the device has `E2e`.
+   **Expect:** "Can't use 'e2e': you already have a profile called 'E2e', and names that differ only in
+   letter case aren't allowed. Pick another name." **Log:** `WARN [PROFILE] Can't use 'e2e': …` and
+   `WARN [SYNC] restore of 'e2e' … refused: …`.
+   To set this up now that the picker refuses it: create `E2e` on B **before** B's storage is set up (so B
+   can't see A's `e2e`), add a server, then set up storage and sync.
+4. **Separate rows:** in that setup B lists `E2e` (**On this device · Synced**) and `e2e` (**In your cloud**)
+   as two rows, never merged.
+   Give each test profile at least one server first: the picker hides cloud profiles with no live items.
+5. **Delete from cloud hits only its own row:** on the `e2e` **In your cloud** row → **⋯** → **Delete from
+   cloud…** → confirm. **Bucket:** only A's `e2e` folder is gone; B's `E2e` folder is untouched.
+6. **Same exact name from two devices:** create `dup` on A and sync; on B create `dup` before setting up
+   storage, then set it up and sync. **Expect** on A: local `dup` shows **On this device** without **Synced** (not
+   linked — the picker can't tell which cloud copy is its own), plus two `dup` **In your cloud** rows. **Get** on either says it
+   already exists; **Delete from cloud…** on one removes only that folder (check the bucket).
+7. **Linux:** create `e2e`, then try `E2e`. **Expect:** refused as in 2 — case-sensitive disks follow the same
+   rule now.
 
-## 9. Delete from cloud and clean up
+## 9. Bucket sync without a sync-server account
 
-1. Picker → each test profile → **Delete from cloud** (or **Delete** on an **In cloud** row) → confirm.
+Both copies signed out (Cloud panel shows **Sign in**), storage on **S3 bucket**.
+
+1. **Sync now** and auto-sync work. **Expect:** no "not signed in"; the Profile panel says "Syncing through
+   your S3 bucket." and shows no **Sync server:** line and no "This profile syncs with …, not with …"
+   warning or **Sync with …** button.
+2. **Get on this device** on B works signed out (test 3), and its Profile panel says "Everything is in sync
+   with your bucket."
+3. **Delete from cloud** works signed out (test 12).
+4. Storage back to **Sync server** while signed out → **Sync now**. **Expect:** "Cloud sync: not signed in…"
+   (the sync server still needs an account). Back to **S3 bucket**.
+5. **Log:** `INFO [SYNC] '<name>' synced: …` lines and no `[CLOUD] NOT_SIGNED_IN` while on S3.
+
+## 10. Sync server and proxy settings
+
+1. **Proxy applies to the bucket:** Cloud panel → **Sync server** (default) → **Proxy** → **Manual**
+   `http://127.0.0.1:9` (nothing listens there) → **Save** → storage **Test connection**. **Expect:** a network
+   error, not "Connected". **Sync now** fails with "Sync to your bucket failed: …". Proxy back to **System**
+   → both work again. **Log:** `WARN [S3] connection test … failed: [S3] NETWORK: …`.
+2. **A bucket endpoint on this machine is never proxied** (only with a local MinIO at `http://127.0.0.1:9000`):
+   with the dead proxy above, **Test connection** to it still works.
+3. **Another sync server doesn't touch bucket profiles** (needs a reachable self-hosted server): set it in the
+   Cloud panel. **Expect:** S3 profiles keep syncing to the bucket with no "syncs with another server"
+   warning. Switch storage to **Sync server** and sign in: a profile that synced with the old server shows
+   upstream's warning and **Sync with …** button; one never synced over HTTP links to the new server on its
+   first sync. Set everything back.
+
+## 11. Profile picker
+
+1. Click a row, type the password, **Unlock**. **Expect:** that profile opens (never another of a similar
+   name). Wrong password: "Wrong password." under the box, `WARN [PICKER] opening '<name>' failed: wrong
+   password` in the log.
+2. **⋯** on each kind of row (**On this device**, **On this device · Synced**, **In your cloud**) — also by
+   right-click and from the keyboard. **Expect:** the menu belongs to that row: **Remove from this device…**
+   only on rows on this device, **Get on this device…** only on **In your cloud** rows, **Delete from
+   cloud…** on rows with a cloud copy.
+3. **Refresh from cloud** fails readably with a broken credentials file (test 6.2's path), and the log has
+   `WARN [PICKER] …`.
+
+## 12. Delete from cloud and clean up
+
+1. Picker → each test profile → **⋯** → **Delete from cloud…** → confirm. Quit the other copy first: a copy
+   that still has the profile open uploads it again on its next sync (known open issue).
    **Expect:** `Removed "<name>" from the cloud (N records).` **Bucket:** `<folder>/` is empty.
    **Log:** `INFO [SYNC] deleted cloud profile <id> (N records)` per profile.
 2. Run the secrets check above on both log files.
 3. Quit both copies and remove their data:
    `~/Library/{Application Support,Caches,WebKit,Logs}/com.submarine.e2e.{a,b}`.
 
-## 10. Acceptance on real machines
+## 13. Acceptance on real machines
 
 Release builds on each real machine (e.g. a Mac and a Linux box), pointed at the real folder. Restore each
 profile on the machine that doesn't have it, edit on one and sync the other, then retire any older sync
@@ -223,3 +281,7 @@ script — keep its last copy in the bucket as a backup.
   after a password change, does the old password still restore the profile from the bucket?
 - Profile panel wording with S3: "This profile lives only on your devices", "N items" includes deletion
   markers, edits show "unattributed" without a cloud account.
+- **Delete from cloud** is undone by any device that still has the profile open: its next sync uploads it
+  again. Needs a design decision.
+- Upstream's archive tests (`archive::tests::sh_runs::…`) fail on macOS with "Abort trap: 6" from the
+  system `tar`/`unzip`, on upstream's own code too.
