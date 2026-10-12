@@ -405,7 +405,7 @@ impl S3Store {
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e) if attempt < ATTEMPTS => {
-                    eprintln!("[S3] retrying after: {}", network_error(e));
+                    crate::applog::warn("S3", format!("retrying after: {}", network_error(e)));
                     tokio::time::sleep(backoff(attempt)).await;
                     continue;
                 }
@@ -432,6 +432,7 @@ impl S3Store {
             }
             let wanted = bucket_region.or_else(|| xml_first(&text, "Region")).filter(|r| !r.is_empty() && *r != region);
             if let (false, Some(r)) = (retried, wanted) {
+                crate::applog::info("S3", format!("server wants region '{r}', not '{region}' — retrying with it"));
                 if let Ok(mut g) = self.region.lock() {
                     *g = r;
                 }

@@ -28,8 +28,14 @@ interface UpdateInfo { current: string; latest: string | null; has_update: boole
 // on-disk vault exists here; `cloud` = the matching cloud partition (or null).
 // Merging local + cloud into a single row is what lets the login screen be the
 // one place to SEE and MANAGE every profile — open it, export it, remove it
-// here, get it from the cloud, or delete it from the cloud.
-interface Row { name: string; local: boolean; cloud: CloudProfile | null; }
+// here, get it from the cloud, or delete it from the cloud. `key` identifies the
+// row: names alone can't, since two cloud profiles may share one.
+interface Row { key: string; name: string; local: boolean; cloud: CloudProfile | null; }
+const localKey = (name: string) => `local:${name}`;
+
+// The picker has no Activity Log: problems it hides or shows go to the log file.
+const logFile = (level: "warn" | "error", message: string) =>
+  invoke("app_log", { level, area: "PICKER", message }).catch(() => {});
 
 interface Props {
   onUnlocked: (profileName: string) => void;
@@ -42,7 +48,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const [info, setInfo] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // The expanded row (by display name). A local row expands to a password +
+  // The expanded row (by row key). A local row expands to a password +
   // Open + actions; a cloud-only row expands to Get + Delete-from-cloud.
   const [selected, setSelected] = useState<string>("");
   const [password, setPassword] = useState("");
@@ -89,7 +95,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     try {
       const list = await invoke<string[]>("list_profiles");
       setProfiles(list);
-      setSelected((prev) => (prev && list.includes(prev) ? prev : list[0] || ""));
+      setSelected((prev) => (prev && list.map(localKey).includes(prev) ? prev : list[0] ? localKey(list[0]) : ""));
     } catch (e: any) {
       setError(String(e));
     } finally {
@@ -105,7 +111,10 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     try {
       const s = await invoke<CloudStatus>("cloud_status");
       setCloudStatus(s);
-      const b = await invoke<SyncStorage>("sync_backend_get").catch(() => null);
+      const b = await invoke<SyncStorage>("sync_backend_get").catch((e) => {
+        logFile("warn", `sync storage settings unreadable: ${e}`);
+        return null;
+      });
       setStorage(b);
       const ready = b?.backend === "s3" ? b.credentials_ok && !!b.s3.bucket : s.signed_in;
       if (ready) {
@@ -114,14 +123,16 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
           // Hide empty / retired partitions (all-tombstone or escrow-only) —
           // they'd just be noise in the picker.
           setCloudProfiles(cps.filter((c) => c.live_records > 0));
-        } catch {
+        } catch (e) {
+          logFile("warn", `listing cloud profiles failed: ${e}`);
           setCloudProfiles([]);
         }
       } else {
         setCloudProfiles([]);
       }
-    } catch {
-      // swallow — network down, modal can still be opened to retry
+    } catch (e) {
+      // Not shown — network down, modal can still be opened to retry.
+      logFile("warn", `cloud status check failed: ${e}`);
     }
   }, []);
 
@@ -159,38 +170,49 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     if (creating) requestAnimationFrame(() => nameInputRef.current?.focus());
   }, [creating]);
 
-  // Merge local + cloud into one ordered list, matched case-insensitively by
-  // display name (a local file and its cloud partition are the SAME profile
-  // even though the partition key may be an opaque UUID). Local-first, then
-  // alphabetical, so the profiles already on this device sit up top.
+  // Merge local + cloud into one ordered list. A local file and its cloud
+  // partition are the SAME profile when their names match EXACTLY — names are
+  // case-sensitive, so `e2e` and `E2e` are two profiles. The name is the only
+  // link (a local vault's partition id is sealed until unlock), so when several
+  // cloud profiles share a name none is linked to the local copy: "Delete from
+  // cloud" must never reach the wrong one. Each unlinked cloud profile gets its
+  // own row. Local-first, then alphabetical, so the profiles already on this
+  // device sit up top.
   const buildRows = (): Row[] => {
-    const byKey = new Map<string, Row>();
-    for (const p of profiles) byKey.set(p.toLowerCase(), { name: p, local: true, cloud: null });
-    for (const c of cloudProfiles) {
-      const k = c.name.toLowerCase();
-      const existing = byKey.get(k);
-      if (existing) existing.cloud = c;
-      else byKey.set(k, { name: c.name, local: false, cloud: c });
+    const cloudByName = new Map<string, CloudProfile[]>();
+    for (const c of cloudProfiles) cloudByName.set(c.name, [...(cloudByName.get(c.name) ?? []), c]);
+    const rows: Row[] = profiles.map((p) => {
+      const matches = cloudByName.get(p) ?? [];
+      const cloud = matches.length === 1 ? matches[0] : null;
+      if (cloud) cloudByName.delete(p);
+      return { key: localKey(p), name: p, local: true, cloud };
+    });
+    for (const list of cloudByName.values()) {
+      for (const c of list) rows.push({ key: `cloud:${c.profile}`, name: c.name, local: false, cloud: c });
     }
-    return Array.from(byKey.values()).sort((a, b) =>
-      a.local !== b.local ? (a.local ? -1 : 1) : a.name.localeCompare(b.name)
+    return rows.sort((a, b) =>
+      a.local !== b.local ? (a.local ? -1 : 1) : a.name.localeCompare(b.name) || a.key.localeCompare(b.key)
     );
   };
   const rows = buildRows();
+  const selectedRow = rows.find((r) => r.key === selected);
 
-  const toggle = (row: Row) => setSelected((prev) => (prev === row.name ? "" : row.name));
+  const toggle = (row: Row) => setSelected((prev) => (prev === row.key ? "" : row.key));
 
   const unlockSelected = async () => {
-    if (!selected) { setError("Pick a profile first."); return; }
+    if (!selectedRow?.local) { setError("Pick a profile first."); return; }
     if (!password) { setError("Type your password."); return; }
+    const name = selectedRow.name;
     setBusy(true); setError(null);
     try {
-      await invoke("select_profile", { name: selected });
+      await invoke("select_profile", { name });
       await invoke("setup_master_db", { password });
-      onUnlocked(selected);
+      onUnlocked(name);
     } catch (e: any) {
       const raw = String(e);
-      setError(raw.toLowerCase().includes("decrypt") ? "Wrong password." : raw);
+      const wrong = raw.toLowerCase().includes("decrypt");
+      logFile("warn", `opening '${name}' failed: ${wrong ? "wrong password" : raw}`);
+      setError(wrong ? "Wrong password." : raw);
     } finally {
       setBusy(false);
     }
@@ -255,7 +277,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       setImportStaged(null);
       setInfo(`Imported as "${trimmed}". Open it with the original password.`);
       await reload();
-      setSelected(trimmed);
+      setSelected(localKey(trimmed));
     } catch (e: any) {
       setError(cleanErr(e));
     } finally {
@@ -267,7 +289,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // there and can be pulled back with its password; if not, it's gone for good
   // — the confirm wording says which.
   const removeLocal = async (name: string) => {
-    const inCloud = cloudProfiles.some((c) => c.name.toLowerCase() === name.toLowerCase());
+    const inCloud = cloudProfiles.some((c) => c.name === name);
     const ok = await confirm({
       title: "Remove from this device",
       message: inCloud
@@ -304,7 +326,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     try {
       const n = await invoke<number>("cloud_delete_profile", { profile: row.cloud.profile });
       setInfo(`Removed "${row.name}" from the cloud (${n} record${n === 1 ? "" : "s"}).`);
-      if (!row.local) setSelected((prev) => (prev === row.name ? "" : prev));
+      if (!row.local) setSelected((prev) => (prev === row.key ? "" : prev));
       await refreshCloud();
     } catch (e: any) {
       setError(cleanErr(e));
@@ -334,7 +356,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       });
       setInfo(`"${c.name}" is now on this device — pulled ${rep.pulled} item${rep.pulled === 1 ? "" : "s"}. Open it below with the same password.`);
       await reload();
-      setSelected(c.name);
+      setSelected(localKey(c.name));
       refreshCloud();
     } catch (e: any) {
       setError(cleanErr(e));
@@ -400,6 +422,9 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               onKeyDown={(e) => e.key === "Enter" && commitImport()}
               className={inputBase + " h-9 text-[13px]"}
               placeholder="Profile name"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
             />
             <div className="flex gap-2">
               <button
@@ -430,6 +455,10 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               onChange={(e) => setNewName(e.target.value)}
               placeholder="Profile name"
               className={inputBase}
+              // Names are case-sensitive: keep exactly what was typed.
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
             />
             <input
               type="password"
@@ -498,9 +527,9 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
 
             <div className="rounded-xl border border-white/5 bg-white/[0.02] overflow-hidden divide-y divide-white/5">
               {rows.map((row) => {
-                const open = selected === row.name;
+                const open = selected === row.key;
                 return (
-                  <div key={row.name}>
+                  <div key={row.key}>
                     <button
                       onClick={() => toggle(row)}
                       className={`w-full flex items-center gap-2.5 px-3 h-11 text-left transition-colors ${open ? "bg-white/[0.03]" : "hover:bg-white/[0.02]"}`}

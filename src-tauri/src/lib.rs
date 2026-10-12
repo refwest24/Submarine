@@ -26,6 +26,7 @@ mod object_sync;
 mod s3_store;
 mod sigv4;
 mod sync_backend;
+mod applog;
 use ssh_manager::SshState;
 use monitor::{MonitorMap, SharedSettings};
 use mirror::MirrorMap;
@@ -116,6 +117,41 @@ pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
         return Err(format!("'{}' is a reserved name on Windows", n));
     }
     Ok(())
+}
+
+/// Refuse a new profile name that's taken in `dir`. Names are case-sensitive,
+/// like file names on Linux: `e2e` and `E2e` are two profiles. But a profile is
+/// the file `<name>.submarine`, and where the disk ignores case (macOS and
+/// Windows by default) those two are the same file, so there the second name is
+/// refused with a message that says why. Asking the disk rather than the OS
+/// keeps case-sensitive macOS volumes and case-insensitive Linux mounts right.
+pub(crate) fn ensure_profile_name_free(dir: &std::path::Path, name: &str) -> Result<(), String> {
+    if !dir.join(format!("{name}.submarine")).exists() {
+        return Ok(());
+    }
+    let (mut exact, mut variant) = (false, None);
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("submarine") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if stem == name {
+            exact = true;
+            break;
+        }
+        if stem.eq_ignore_ascii_case(name) {
+            variant = Some(stem.to_string());
+        }
+    }
+    let message = match (exact, variant) {
+        (false, Some(other)) => format!(
+            "Can't use '{name}' here: this device's disk ignores letter case, so it would be the same file as your profile '{other}'. Pick another name."
+        ),
+        _ => format!("Profile '{name}' already exists"),
+    };
+    applog::warn("PROFILE", &message);
+    Err(message)
 }
 
 // Argon2id parameters for vault-key derivation:
@@ -909,14 +945,14 @@ fn apply_remote_inner(conn: &Connection, key: &[u8; 32], records: &[SyncRecord],
         for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
             if let Err(e) = apply_entity(&tx, key, spec, rec, &mut fk_fixups) {
                 skipped += 1;
-                eprintln!("[SYNC] skipped record uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
+                applog::warn("SYNC", format!("skipped record uuid={} type={}: {}", rec.uuid, rec.entity_type, e));
             }
         }
     }
     for rec in records.iter().filter(|r| r.deleted) {
         if let Err(e) = apply_tombstone(&tx, rec) {
             skipped += 1;
-            eprintln!("[SYNC] skipped tombstone uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
+            applog::warn("SYNC", format!("skipped tombstone uuid={} type={}: {}", rec.uuid, rec.entity_type, e));
         }
     }
     // Re-resolve every optional FK against the FINAL state of the batch, now that
@@ -933,17 +969,17 @@ fn apply_remote_inner(conn: &Connection, key: &[u8; 32], records: &[SyncRecord],
             &format!("UPDATE {} SET {}=?1 WHERE uuid=?2", f.table, f.fk_col),
             rusqlite::params![id, f.uuid],
         ) {
-            eprintln!("[SYNC] fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
+            applog::warn("SYNC", format!("fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e));
             continue;
         }
         if let Err(e) = note_pending_fk(&tx, &f, id.is_some()) {
-            eprintln!("[SYNC] fk pending skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
+            applog::warn("SYNC", format!("fk pending skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e));
         }
     }
     retry_pending_fks(&tx);
     tx.commit().map_err(|e| format!("[SYNC] TX_COMMIT: {e}"))?;
     if skipped > 0 {
-        eprintln!("[SYNC] merge committed with {skipped} record(s) skipped");
+        applog::warn("SYNC", format!("merge committed with {skipped} record(s) skipped"));
     }
     Ok(())
 }
@@ -995,7 +1031,7 @@ fn retry_pending_fks(conn: &Connection) {
         }) {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!("[SYNC] fk pending read failed: {e}");
+            applog::warn("SYNC", format!("fk pending read failed: {e}"));
             return;
         }
     };
@@ -1029,7 +1065,7 @@ fn retry_pending_fks(conn: &Connection) {
                 &format!("UPDATE {tbl} SET {fk_col}=?1 WHERE uuid=?2 AND updated_at=?3"),
                 rusqlite::params![id, uuid, referrer_ua],
             ) {
-                eprintln!("[SYNC] fk pending repair failed {tbl}.{fk_col} uuid={uuid}: {e}");
+                applog::warn("SYNC", format!("fk pending repair failed {tbl}.{fk_col} uuid={uuid}: {e}"));
             }
         }
         let _ = conn.execute(
@@ -1281,8 +1317,25 @@ fn open_pw_escrow(blob_hex: &str, password: &str) -> Result<[u8; 32], String> {
 /// server's records back, and persist. Full-set each call (the dataset is
 /// small — a handful of servers/credentials); a `since` watermark is a later
 /// optimisation, not needed for correctness.
+/// Every outcome is written to the app log; `sync_now_inner` does the work.
 #[tauri::command]
 async fn sync_now(
+    app: tauri::AppHandle,
+    db_state: tauri::State<'_, DbState>,
+    cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
+) -> Result<SyncReport, String> {
+    let profile = db_state.active_profile.lock().ok().and_then(|p| p.clone()).unwrap_or_default();
+    let started = std::time::Instant::now();
+    let result = sync_now_inner(app, db_state, cloud).await;
+    let ms = started.elapsed().as_millis();
+    match &result {
+        Ok(r) => applog::info("SYNC", format!("'{profile}' synced: pushed {}, pulled {} ({ms} ms)", r.pushed, r.pulled)),
+        Err(e) => applog::error("SYNC", format!("'{profile}' sync failed after {ms} ms: {e}")),
+    }
+    result
+}
+
+async fn sync_now_inner(
     app: tauri::AppHandle,
     db_state: tauri::State<'_, DbState>,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
@@ -1891,9 +1944,7 @@ async fn import_shared_profile(
     }
     let dir = profiles_dir(&app)?;
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-    if profile_path(&app, &local_name)?.exists() {
-        return Err(format!("Profile '{}' already exists", local_name));
-    }
+    ensure_profile_name_free(&dir, &local_name)?;
     *db_state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(local_name.clone());
     // setup_master_db consumes a State handle; hand it a fresh one from `app` so
     // our own `db_state` stays usable for the sync_meta writes + sync below.
@@ -1990,6 +2041,28 @@ async fn restore_personal_profile(
     local_name: String,
     vault_password: String,
 ) -> Result<SyncReport, String> {
+    let what = format!("'{local_name}' from cloud profile {cloud_profile}");
+    let result =
+        restore_personal_profile_inner(app, db_state, cloud, cloud_profile, local_name, vault_password).await;
+    match &result {
+        Ok(r) => applog::info("SYNC", format!("restored {what}: pulled {}", r.pulled)),
+        // A wrong password or a taken name is the user's input being refused, not a fault.
+        Err(e) if e.contains("ESCROW_UNSEAL_FAILED") || e.starts_with("Can't use '") || e.ends_with("already exists") => {
+            applog::warn("SYNC", format!("restore of {what} refused: {e}"))
+        }
+        Err(e) => applog::error("SYNC", format!("restore of {what} failed: {e}")),
+    }
+    result
+}
+
+async fn restore_personal_profile_inner(
+    app: tauri::AppHandle,
+    db_state: tauri::State<'_, DbState>,
+    cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
+    cloud_profile: String,
+    local_name: String,
+    vault_password: String,
+) -> Result<SyncReport, String> {
     // Validate up front so a bad name/empty password fails before any network.
     let cloud_profile = cloud_profile.trim().to_string();
     if cloud_profile.is_empty() {
@@ -2022,9 +2095,7 @@ async fn restore_personal_profile(
     // Create the local vault (fresh profile) — same steps as create_profile.
     let dir = profiles_dir(&app)?;
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-    if profile_path(&app, &local_name)?.exists() {
-        return Err(format!("Profile '{}' already exists", local_name));
-    }
+    ensure_profile_name_free(&dir, &local_name)?;
     *db_state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(local_name.clone());
     {
         use tauri::Manager as _;
@@ -2125,7 +2196,7 @@ async fn rotate_share_dek(
         // replaced. They simply can't decrypt until re-invited, which is the
         // safe direction to fail.
         if let Err(e) = cloud::invite_member(app, cloud, share_id, &m.email, &m.role, &sealed).await {
-            eprintln!("[SHARE] re-seal failed for {}: {e}", m.email);
+            applog::warn("SHARE", format!("re-seal failed for {}: {e}", m.email));
         }
     }
 
@@ -2298,7 +2369,7 @@ async fn stop_sharing(
         // vault stayed pointed at a dead share that errored on every sync
         // forever. Best-effort tell the server, then clear regardless.
         if let Err(e) = cloud::leave_share(&app, &cloud, &share_id).await {
-            eprintln!("[SHARE] leave_share failed, clearing locally anyway: {e}");
+            applog::warn("SHARE", format!("leave_share failed, clearing locally anyway: {e}"));
         }
     }
     {
@@ -3189,7 +3260,9 @@ async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<String>, Stri
             }
         }
     }
-    out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    // Case-insensitive order reads naturally; names equal but for case (two
+    // profiles on a case-sensitive disk) then sort exactly, so the order is stable.
+    out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
     Ok(out)
 }
 
@@ -3223,7 +3296,12 @@ async fn cloud_delete_profile(
     if profile.is_empty() {
         return Err("[SYNC] NO_PROFILE_NAME".into());
     }
-    sync_backend::personal_transport(&app, &cloud)?.delete_profile(&profile).await
+    let result = sync_backend::personal_transport(&app, &cloud)?.delete_profile(&profile).await;
+    match &result {
+        Ok(n) => applog::info("SYNC", format!("deleted cloud profile {profile} ({n} records)")),
+        Err(e) => applog::error("SYNC", format!("deleting cloud profile {profile} failed: {e}")),
+    }
+    result
 }
 
 /// Replace this profile's entire cloud copy with what's on THIS device.
@@ -3268,7 +3346,7 @@ async fn force_push_profile(
         return Err("[SYNC] SHARED_PROFILE: this profile is shared with other people, and replacing the cloud copy would delete their changes too. Stop sharing first if you really want to reset it.".into());
     }
     let removed = sync_backend::personal_transport(&app, &cloud)?.delete_profile(&cloud_profile).await?;
-    eprintln!("[SYNC] force push: server dropped {removed} record(s) for '{cloud_profile}'");
+    applog::warn("SYNC", format!("force push: server dropped {removed} record(s) for '{cloud_profile}'"));
     // Pushes are always a full set, so the very next sync repopulates the
     // partition from this vault — including a fresh DEK escrow record.
     sync_now(app, db_state, cloud).await
@@ -3392,6 +3470,7 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<()
         fs::remove_file(&path)
             .map_err(|e| format!("[FILE] DELETE_PROFILE_FAILED at {:?}: {}", path, e))?;
     }
+    applog::info("PROFILE", format!("removed local profile '{name}'"));
     Ok(())
 }
 
@@ -3518,10 +3597,8 @@ async fn import_profile_save(
 
     let dir = profiles_dir(&app_handle)?;
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
+    ensure_profile_name_free(&dir, &name)?;
     let dst = profile_path(&app_handle, &name)?;
-    if dst.exists() {
-        return Err(format!("Profile '{}' already exists", name));
-    }
 
     // Single-read import: load the file into memory ONCE, validate the
     // header on the in-memory bytes, then write to the destination. The
@@ -3538,6 +3615,7 @@ async fn import_profile_save(
 
     fs::write(&dst, &bytes)
         .map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", dst, e))?;
+    applog::info("PROFILE", format!("imported profile '{name}'"));
     Ok(())
 }
 
@@ -3934,11 +4012,8 @@ async fn create_profile(
     }
     let dir = profiles_dir(&app_handle)?;
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-    let path = profile_path(&app_handle, &name)?;
-    if path.exists() {
-        return Err(format!("Profile '{}' already exists", name));
-    }
-    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name);
+    ensure_profile_name_free(&dir, &name)?;
+    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name.clone());
     // Reuse setup_master_db's fresh-schema branch by deferring to it. Empty
     // profile starts with the same migrations the legacy path would do.
     setup_master_db(app_handle.clone(), password, state).await?;
@@ -3970,6 +4045,7 @@ async fn create_profile(
         .map_err(|e| format!("[STATE] CLOUD_PROFILE_STORE: {e}"))?;
     }
     save_vault_internal(&db_state)?;
+    applog::info("PROFILE", format!("created profile '{name}'"));
     Ok(())
 }
 
@@ -5215,7 +5291,7 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     use tauri::Emitter;
 
     let log = |msg: &str, ty: &str| {
-        println!("[LOG-{}] {}", session_id, msg);
+        applog::by_kind(ty, "SSH", format!("[{session_id}] {msg}"));
         let _ = app.emit(
             &format!("session-log-{}", session_id),
             serde_json::json!({"msg": msg, "type": ty}),
@@ -5515,7 +5591,7 @@ async fn connect_jump_host(
     use tauri::Emitter;
 
     let log = |msg: &str, ty: &str| {
-        println!("[LOG-{}] [jump] {}", session_id, msg);
+        applog::by_kind(ty, "SSH", format!("[{session_id}] [jump] {msg}"));
         let _ = app.emit(
             &format!("session-log-{}", session_id),
             serde_json::json!({"msg": msg, "type": ty}),
@@ -5724,7 +5800,7 @@ async fn initiate_connection(
     //   - "sftp" secondary         → no
     let start_tunnels_inline = role == "primary" && !separate;
 
-    println!("[BACKEND] initiate_connection invoked for session_id: {} (role: {}, separate: {}), server_id: {}", session_id, role, separate, server_id);
+    applog::info("SSH", format!("[{session_id}] connect requested (role: {role}, separate: {separate}), server_id: {server_id}"));
 
     // Reconnect path: if a previous session under this id is still registered,
     // tear it down before starting the fresh handshake. Without this, the
@@ -5735,7 +5811,7 @@ async fn initiate_connection(
     {
         let mut conns = state.connections.lock().await;
         if conns.remove(&session_id).is_some() {
-            println!("[BACKEND] Tearing down stale session for reconnect: {}", session_id);
+            applog::info("SSH", format!("[{session_id}] tearing down stale session for reconnect"));
         }
     }
     // Drop any ProxyJump bastion handle from a prior attempt — dropping it
@@ -5761,7 +5837,6 @@ async fn initiate_connection(
         next
     };
 
-    println!("[BACKEND] No duplicates found. Registering oneshot channel and spawning connection worker...");
     let (fp_tx, fp_rx) = tokio::sync::oneshot::channel();
     // Random per-connect nonce — keys the fp_txs map so a stale `accept`
     // for one attempt (frontend bug, malicious IPC call, retry race)
@@ -5994,7 +6069,6 @@ async fn initiate_connection(
     let mirrors_owned: MirrorMap = mirrors.inner().clone();
 
     tauri::async_runtime::spawn(async move {
-        println!("[BACKEND WORKER] Started connection worker thread for session: {}", session_id_clone);
 
         struct FpCleanupGuard {
             fp_txs: Arc<Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
@@ -6021,7 +6095,7 @@ async fn initiate_connection(
         };
 
         let emit_log = |msg: &str, log_type: &str| {
-            println!("[LOG-{}] {}", session_id_clone, msg);
+            applog::by_kind(log_type, "SSH", format!("[{session_id_clone}] {msg}"));
             let _ = app.emit(&format!("session-log-{}", session_id_clone), serde_json::json!({"msg": msg, "type": log_type}));
         };
 
@@ -6045,12 +6119,24 @@ async fn initiate_connection(
         emit_log(&format!("[DEBUG] SQLite DB key_id: {:?}", db_key_id), "info");
         emit_log(&format!("[DEBUG] effective_key_id determined: {:?}", effective_key_id), "info");
         if let Some((ref priv_key, ref passphrase)) = key_data {
-            emit_log(&format!("[DEBUG] SSH Key loaded from DB. Private Key length: {} chars, Has Passphrase: {}", priv_key.len(), passphrase.is_some()), "info");
+            emit_log(&format!("[DEBUG] SSH Key loaded from DB. Private Key length: {} chars, {}", priv_key.len(), if passphrase.is_some() { "with a passphrase" } else { "no passphrase" }), "info");
             if priv_key.trim().is_empty() {
                 emit_log("[DEBUG] WARNING: SSH Key content is EMPTY!", "error");
             } else {
-                let first_line = priv_key.lines().next().unwrap_or("");
-                emit_log(&format!("[DEBUG] SSH Key Header: {}", first_line), "info");
+                // Name the format, never echo the line: a key pasted without
+                // its armour line would put key material here.
+                let first_line = priv_key.lines().next().unwrap_or("").trim();
+                let format = if first_line.starts_with("-----BEGIN ") && first_line.ends_with("-----") {
+                    match first_line.trim_matches('-').trim_start_matches("BEGIN ").trim_end_matches("PRIVATE KEY").trim() {
+                        "" => "PKCS#8",
+                        kind => kind,
+                    }
+                } else if first_line.starts_with("PuTTY-User-Key-File") {
+                    "PuTTY"
+                } else {
+                    "unrecognised (no PEM header)"
+                };
+                emit_log(&format!("[DEBUG] SSH key format: {format}"), "info");
             }
         } else {
             emit_log("[DEBUG] No SSH Key was loaded from database for this session.", "info");
@@ -9292,13 +9378,13 @@ async fn sftp_open_remote_file(
         let mut debouncer = match new_debouncer(std::time::Duration::from_millis(750), raw_tx) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[sftp-live-edit] debouncer init failed: {} — falling back to no autosync", e);
+                applog::warn("SFTP", format!("debouncer init failed: {} — falling back to no autosync", e));
                 let _ = std::fs::remove_file(&temp_file_path_clone);
                 return;
             }
         };
         if let Err(e) = debouncer.watcher().watch(&temp_file_path_clone, RecursiveMode::NonRecursive) {
-            eprintln!("[sftp-live-edit] watch failed: {} — falling back to no autosync", e);
+            applog::warn("SFTP", format!("watch failed: {} — falling back to no autosync", e));
             let _ = std::fs::remove_file(&temp_file_path_clone);
             return;
         }
@@ -10873,12 +10959,17 @@ pub fn run() {
         // (to load any persisted bearer token). Setup is the earliest hook we
         // get an AppHandle, so initialise it there and `manage` it for commands.
         .setup(|app| {
+            if let Ok(dir) = app.path().app_log_dir() {
+                applog::init(dir);
+            }
+            applog::info("APP", format!("Submarine {} started ({})", env!("CARGO_PKG_VERSION"), app.config().identifier));
             let cloud_state = cloud::CloudState::new(&app.handle());
             app.manage(cloud_state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             check_db_exists, setup_master_db, persist_vault,
+            applog::app_log, applog::app_log_path,
             list_profiles, cloud_list_sync_profiles, cloud_delete_profile, force_push_profile, select_profile, create_profile, delete_profile, close_profile,
             export_profile, import_profile_pick, import_profile_save,
             cloud::cloud_status, cloud::cloud_signup, cloud::cloud_consume_verify_link,
@@ -10944,6 +11035,31 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_names_are_case_sensitive_where_the_disk_allows() {
+        let dir = std::env::temp_dir().join(format!("submarine-names-{}", new_entity_uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("e2e.submarine"), b"x").unwrap();
+        fs::write(dir.join("notes.txt"), b"x").unwrap();
+        // Does this disk ignore case? (macOS and Windows by default; Linux not.)
+        let ignores_case = dir.join("E2E.submarine").exists();
+
+        assert_eq!(ensure_profile_name_free(&dir, "work"), Ok(()));
+        assert_eq!(ensure_profile_name_free(&dir, "notes"), Ok(()), "only .submarine files are profiles");
+        assert_eq!(ensure_profile_name_free(&dir, "e2e"), Err("Profile 'e2e' already exists".into()));
+        let upper = ensure_profile_name_free(&dir, "E2e");
+        if ignores_case {
+            let msg = upper.unwrap_err();
+            assert!(msg.contains("ignores letter case") && msg.contains("'e2e'"), "{msg}");
+        } else {
+            assert_eq!(upper, Ok(()), "a case-sensitive disk holds e2e and E2e side by side");
+            // With both present, the exact name wins over its case variant.
+            fs::write(dir.join("E2e.submarine"), b"x").unwrap();
+            assert_eq!(ensure_profile_name_free(&dir, "E2e"), Err("Profile 'E2e' already exists".into()));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn dir_entry_name_rejects_traversal_and_separators() {

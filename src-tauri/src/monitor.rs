@@ -543,7 +543,11 @@ async fn run_poller(
                 let _ = app.emit(&format!("monitor-sample-{}", node_id), sample);
             }
             Err(e) => {
-                eprintln!("[monitor] poll failed for node {}: {}", node_id, e);
+                // Once per outage, not once per poll: a server that stays down
+                // would otherwise fill the log.
+                if entry.state.lock().await.consecutive_failures == 0 {
+                    crate::applog::warn("MONITOR", format!("poll failed for node {node_id}: {e}"));
+                }
                 handle = None;
                 record_failure(&app, &entry, &node_name, threshold, &e, notify, beep).await;
                 mark_disconnected(&app, &entry, Some(e)).await;

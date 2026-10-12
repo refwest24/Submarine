@@ -332,7 +332,7 @@ where
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok((i, r)) => out[i] = Some(r),
-            Err(e) => eprintln!("[S3] request task failed: {e}"),
+            Err(e) => crate::applog::warn("S3", format!("request task failed: {e}")),
         }
     }
     out.into_iter()
@@ -464,7 +464,7 @@ impl<S: ObjectStore> SyncTransport for ObjectSync<S> {
                 // newer version arrives with the next sync.
                 None => continue,
                 Some(b) if b.len() > MAX_BODY_BYTES => {
-                    eprintln!("[S3] skipped oversized object {} ({} bytes)", v.rel, b.len());
+                    crate::applog::warn("S3", format!("skipped oversized object {} ({} bytes)", v.rel, b.len()));
                 }
                 Some(b) => remote.push(SyncRecord {
                     uuid: v.uuid,
@@ -481,7 +481,7 @@ impl<S: ObjectStore> SyncTransport for ObjectSync<S> {
             let keys: Vec<String> = plan.gc.iter().map(|rel| format!("{part}{rel}")).collect();
             for r in self.delete_all(keys).await {
                 if let Err(e) = r {
-                    eprintln!("[S3] cleanup skipped: {e}");
+                    crate::applog::warn("S3", format!("cleanup skipped: {e}"));
                 }
             }
         }

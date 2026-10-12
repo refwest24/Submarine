@@ -59,7 +59,8 @@ interface ShareStatus {
 interface MemberInfo { user_id: number; email: string; role: string; status: string; }
 
 type Props = {
-  onSync: () => Promise<void> | void;
+  /** Resolves to the error text when the sync failed (already in the Activity Log), else null. */
+  onSync: () => Promise<string | null>;
   syncing: boolean;
   lastSyncLabel: string | null;
   autoSync: boolean;
@@ -237,7 +238,9 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
   };
 
   const doSync = async () => {
-    await onSync();
+    setErr(null);
+    const failed = await onSync();
+    if (failed) setErr(failed);
     refresh();
     loadStats();
   };

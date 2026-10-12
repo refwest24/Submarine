@@ -115,6 +115,10 @@ pub fn load_config(app: &tauri::AppHandle) -> Result<BackendConfig, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BackendConfig::default()),
         Err(e) => Err(format!("[S3] CONFIG_INVALID: {CONFIG_FILENAME}: {e}")),
     }
+    .map_err(|e| {
+        crate::applog::error("S3", &e);
+        e
+    })
 }
 
 /// Write via temp file + rename so a crash can't leave a half-written config
@@ -170,16 +174,15 @@ pub fn validate_s3(s: &S3Settings) -> Result<S3Settings, String> {
     Ok(s)
 }
 
-/// Whether personal sync can run on this install, without a network call:
-/// HTTP needs a cloud session; S3 needs a bucket and a readable credentials
-/// file. An unreadable config counts as S3-not-ready (only S3 setups write it).
+/// Whether personal sync is set up on this install, without a network call:
+/// HTTP needs a cloud session; S3 needs a bucket. A credentials file that can't
+/// be read doesn't count against it: sync stays offered and fails with a
+/// readable `CREDENTIALS_FILE` error instead of looking never set up. An
+/// unreadable config counts as S3-not-ready (only S3 setups write it).
 pub async fn personal_sync_status(app: &tauri::AppHandle, cloud: &CloudState) -> (Backend, bool) {
     match load_config(app) {
         Ok(cfg) if cfg.backend == Backend::Http => (Backend::Http, cloud.status().await.signed_in),
-        Ok(cfg) => (
-            Backend::S3,
-            !cfg.s3.bucket.trim().is_empty() && crate::s3_store::read_s3cmd_config(&cfg.s3.credentials_file).is_ok(),
-        ),
+        Ok(cfg) => (Backend::S3, !cfg.s3.bucket.trim().is_empty()),
         Err(_) => (Backend::S3, false),
     }
 }
@@ -224,7 +227,17 @@ pub async fn sync_backend_set(app: tauri::AppHandle, config: BackendConfig) -> R
         Backend::S3 => BackendConfig { backend: Backend::S3, s3: validate_s3(&config.s3)? },
         Backend::Http => config,
     };
-    save_config(&app, &cfg)?;
+    save_config(&app, &cfg).map_err(|e| {
+        crate::applog::error("S3", &e);
+        e
+    })?;
+    match cfg.backend {
+        Backend::S3 => crate::applog::info(
+            "S3",
+            format!("sync storage set to bucket '{}', folder '{}', credentials file {}", cfg.s3.bucket, cfg.s3.prefix, cfg.s3.credentials_file),
+        ),
+        Backend::Http => crate::applog::info("S3", "sync storage set to Submarine Cloud"),
+    }
     Ok(view(cfg))
 }
 
@@ -233,6 +246,16 @@ pub async fn sync_backend_set(app: tauri::AppHandle, config: BackendConfig) -> R
 /// never be taken for a profile partition.
 #[tauri::command]
 pub async fn s3_test_connection(settings: S3Settings) -> Result<String, String> {
+    let target = format!("bucket '{}', folder '{}'", settings.bucket.trim(), settings.prefix.trim());
+    let result = test_connection(settings).await;
+    match &result {
+        Ok(msg) => crate::applog::info("S3", format!("connection test OK: {msg}")),
+        Err(e) => crate::applog::warn("S3", format!("connection test for {target} failed: {e}")),
+    }
+    result
+}
+
+async fn test_connection(settings: S3Settings) -> Result<String, String> {
     use crate::object_sync::ObjectStore as _;
     let settings = validate_s3(&settings)?;
     let store = crate::s3_store::S3Store::new(&settings)?;

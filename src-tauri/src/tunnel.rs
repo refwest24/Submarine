@@ -956,7 +956,7 @@ pub async fn bridge_forwarded_channel(
             let _ = pump_bidirectional(&mut local, &mut stream).await;
         }
         Err(e) => {
-            eprintln!("[remote-forward] connect to {} failed: {}", entry.target, e);
+            crate::applog::warn("TUNNEL", format!("remote-forward connect to {} failed: {}", entry.target, e));
             // Dropping the channel stream closes it; the server reports EOF
             // back to the outside connector.
         }
