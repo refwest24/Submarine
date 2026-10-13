@@ -292,6 +292,10 @@ script — keep its last copy in the bucket as a backup.
 ## Known open issues to re-check
 
 - Restore's wrong-password message shows the error code; unlocking a local copy says "Wrong password."
+- The picker's "Couldn't load your cloud profiles: …" banner (test 11.3) shows the error code
+  (`CREDENTIALS_FILE: can't read …`) and stays on screen after the settings are fixed, until another message
+  replaces it. The dead-proxy error (test 10.1) is the HTTP client's raw text ("error sending request: client
+  error (Connect): tunnel error: … Connection refused"), not a sentence.
 - Every restore adds an `escrow/…` object; none are removed until the profile is deleted. Open question:
   after a password change, does the old password still restore the profile from the bucket?
 - Profile panel wording with S3: "This profile lives only on your devices", "N items" includes deletion
