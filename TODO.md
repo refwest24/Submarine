@@ -104,6 +104,16 @@ Shared profiles stay on the HTTP cloud.
         `profile_sync_stats` comparable flag; `view()` with a missing file. Frontend: no test runner at all —
         decide whether to add vitest for `buildRows`, `nameProblem`, `handleCloudSync`, `cleanErr`
 
+- [ ] 15. Linux run (Mint 22) — brief for the session: `docs/linux-test-session.md`
+  - [ ] 15.1 Toolchain; `cargo test --lib` (first run on Linux: do the 7 macOS archive failures pass here?),
+        typecheck, build
+  - [ ] 15.2 Test copy built with `--no-bundle` + identifier override; data/log paths verified; the Linux
+        recipe written into `docs/manual-tests.md` §0
+  - [ ] 15.3 Manual tests on the scratch folder: §1, §2, §8.7 (the Linux-only case test), §11.1, §6.1–6.2,
+        §10.1, §11.3, §12; §3–§4 if a second device is available
+  - [ ] 15.4 Linux-specific differences recorded; small Linux-only fixes made
+  - [ ] 15.5 §13 acceptance with the real folder on the Linux machine and the Mac (backups first)
+
 Decision (9.3, user 2026-10-05), **superseded 2026-10-12**: names that differ only in case were allowed where the
 disk is case-sensitive. Now (decision 8, step 13.5): a new name matching an existing profile in any letter case
 is refused on every platform; names are still kept and matched exactly as typed.
@@ -241,9 +251,11 @@ is refused on every platform; names are still kept and matched exactly as typed.
 - **PR #1 and PR #2 are merged** into the fork's `main` (`e3cc909`); the manual re-run on that code passed
   (13.10, progress note above). Upstream has moved on since `75678e5` (11 fixes on 2026-10-13, three files
   conflict either way) — parked, not needed for anything here.
-- **Next, in order:** design calls:
+- **On the Linux machine:** start with `docs/linux-test-session.md` (step 15). The design calls below don't
+  block it.
+- **Next, in order:** step 15 (Linux run) → design calls:
   "Delete from cloud" vs. a device that still has the profile open, and the two items under "Found in the
-  test review" → §13 Mac + Linux acceptance → not run yet: §5, §6.3, §7, §8.1, §8.6–8.7, §10.2–10.3 (need
+  test review" → §13 Mac + Linux acceptance (15.5) → not run yet: §5, §6.3, §7, §8.1, §8.6, §10.2–10.3 (need
   MinIO / a self-hosted server) → 14.6 → polish list (the two 13.10 items are small UI fixes).
 - Upstream's archive tests fail on macOS (see step 13 note) — report upstream or ignore; not this PR's.
 - Screenshots `Image1–9.png` in the repo root are untracked and show the bucket/host — never commit them.

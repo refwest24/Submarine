@@ -3,7 +3,8 @@
 Submarine is a Tauri 2 desktop app: a Rust backend in `src-tauri/` and a React + TypeScript UI in `src/`.
 This fork adds personal-profile sync through an S3-compatible bucket. The plan, decisions and progress live
 in `TODO.md` (start at its "Resume here" section); hard-won gotchas are in `LESSONS.md`; the click-through
-test procedure is `docs/manual-tests.md`.
+test procedure is `docs/manual-tests.md`. On the Linux machine, `docs/linux-test-session.md` is the brief for
+the test session there (toolchain, how to build a test copy without bundling, which tests only Linux can run).
 
 ## Toolchain and checks
 
