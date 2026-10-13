@@ -190,8 +190,11 @@ is refused on every platform; names are still kept and matched exactly as typed.
   "Couldn't load your cloud profiles" banner + `WARN [PICKER] listing cloud profiles failed` ✔; §11.1 wrong
   password on **Unlock** → "Wrong password." + `WARN [PICKER] opening 'E2e' failed: wrong password` ✔; §12
   Delete `E2e` from cloud (3 records) ✔, pattern secrets grep over both logs empty (83 lines) ✔; both copies
-  quit. The user's part of §12 (bucket listing empty, grep for the real passwords/access key, remove the app
-  data) was handed over and not yet confirmed here. Not run this time: §5, §6.3, §7, §8.1, §8.2 (ran 10-12),
+  quit. Cleanup confirmed (user): `s3cmd ls -r` of the test folder prints nothing, e2e app data and logs
+  removed. The per-password grep was run with the placeholder text again, so it proved nothing — but both
+  logs were read in full (83 lines) before deletion and every line is one of the structured messages the doc
+  quotes, with no free-text field that could hold a password or key. Next run: substitute the real values
+  before pressing Enter, or skip that grep (the pattern grep is the one that matters). Not run this time: §5, §6.3, §7, §8.1, §8.2 (ran 10-12),
   §8.6–8.7, §10.2–10.3, §11.2's right-click/keyboard paths, §13.
   Polish seen (added to the list below): the picker's "Couldn't load your cloud profiles" banner keeps the
   `CREDENTIALS_FILE:` code (`cleanErr` strips `[S3]` only) and stays on screen after the path is fixed and
@@ -238,7 +241,7 @@ is refused on every platform; names are still kept and matched exactly as typed.
 - **PR #1 and PR #2 are merged** into the fork's `main` (`e3cc909`); the manual re-run on that code passed
   (13.10, progress note above). Upstream has moved on since `75678e5` (11 fixes on 2026-10-13, three files
   conflict either way) — parked, not needed for anything here.
-- **Next, in order:** confirm the §12 cleanup (bucket folder empty, e2e app data removed) → design calls:
+- **Next, in order:** design calls:
   "Delete from cloud" vs. a device that still has the profile open, and the two items under "Found in the
   test review" → §13 Mac + Linux acceptance → not run yet: §5, §6.3, §7, §8.1, §8.6–8.7, §10.2–10.3 (need
   MinIO / a self-hosted server) → 14.6 → polish list (the two 13.10 items are small UI fixes).
