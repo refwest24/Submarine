@@ -74,7 +74,9 @@ Shared profiles stay on the HTTP cloud.
         proxy, self-hosted server coexistence, portable log location)
   - [x] 13.9 Fast-forward the fork's `main` to upstream (`refwest24/Submarine` only), push this branch;
         PR #1 shows only this branch's changes
-  - [ ] 13.10 User re-runs the key manual checks on fresh test copies
+  - [x] 13.10 Key manual checks re-run on fresh copies of the merged code (2026-10-13, after PR #2): tests 1–4,
+        6.1–6.2, 8.3–8.5, 9, 10.1 (connection test), 11.1, 11.3, 12 pass — see the progress note; three
+        polish items added to the list below
 
 - [ ] 14. Test review after the upstream merge (2026-10-13, branch `fix/test-review-after-upstream-merge`, PR #2)
   - [x] 14.1 `docs/manual-tests.md` corrected where it disagreed with the code: §9.4 (HTTP + signed out hides
@@ -166,7 +168,35 @@ is refused on every platform; names are still kept and matched exactly as typed.
     fix it "from the Cloud panel on the profile picker" though Settings → Cloud Sync works too; a stale
     "bucket doesn't exist" message stays under the form after the bucket name is corrected; Settings shows
     the can't-read warning and a green "Saved — personal profiles now sync" together; the picker hides
-    cloud profiles with no live items, so an empty profile never shows In cloud.
+    cloud profiles with no live items, so an empty profile never shows In cloud. From 13.10: the picker's
+    "Couldn't load your cloud profiles" banner shows the `CREDENTIALS_FILE:` code and outlives the fix (it
+    stays until another banner replaces it); the dead-proxy message is reqwest's raw error chain rather than
+    "can't reach the endpoint through the proxy".
+- **Step 13.10 — re-run on the merged code (2026-10-13, copies rebuilt from `e3cc909` = PR #2 merged, app data
+  and `submarine/sync-test/` empty at the start):** §1 storage setup A+B (connection test OK, bar shows the
+  folder) ✔; §2 `e2e` on A with a saved login and a linked server, each change pushed (`pushed 1`), **Sync now**
+  "Cloud sync complete" ✔; §3 Get on B: wrong password → `ESCROW_UNSEAL_FAILED` as WARN, right password →
+  `restored 'e2e' … pulled 2`, servers + login link present ✔; §4 edit on B → A `pulled 1`, delete on A → B
+  `pulled 1` (counts match in both logs) ✔; §6.1 `<bucket>-nope` → `BUCKET_NOT_FOUND` ✔; §6.2 missing
+  credentials file → panel and Activity Log say "Sync storage isn't set up: can't read …/missing … — fix it in
+  Settings → Cloud Sync." (the 14.2 message), `ERROR [SYNC] … [S3] CREDENTIALS_FILE` in the log ✔; §9.4 storage
+  on **Sync server** while signed out: **Sync now** hidden, "Not signed in — lock this profile…" shown, auto-sync
+  logs `[CLOUD] NOT_SIGNED_IN` twice; back on **S3 bucket** `E2e` syncs signed out (`pushed 1`) ✔ (§9.1–9.3 are
+  covered by §3, §12 and this); §8.3 Get `e2e` beside `E2e` refused with the decision-8 message, both WARN lines
+  ✔; §8.4 `E2e` **Synced** + `e2e` **In your cloud** as two rows ✔; §8.5 Delete `e2e` from cloud (7 records, A
+  quit first) left `E2e` synced ✔; §10.1 Manual proxy `http://127.0.0.1:9` → four `retrying after: [S3]
+  ENDPOINT_UNREACHABLE` lines then the failed connection-test line, proxy back → connection OK ✔ (the **Sync
+  now** half wasn't run: the profile was locked); §11.3 Refresh from cloud with the missing credentials path →
+  "Couldn't load your cloud profiles" banner + `WARN [PICKER] listing cloud profiles failed` ✔; §11.1 wrong
+  password on **Unlock** → "Wrong password." + `WARN [PICKER] opening 'E2e' failed: wrong password` ✔; §12
+  Delete `E2e` from cloud (3 records) ✔, pattern secrets grep over both logs empty (83 lines) ✔; both copies
+  quit. The user's part of §12 (bucket listing empty, grep for the real passwords/access key, remove the app
+  data) was handed over and not yet confirmed here. Not run this time: §5, §6.3, §7, §8.1, §8.2 (ran 10-12),
+  §8.6–8.7, §10.2–10.3, §11.2's right-click/keyboard paths, §13.
+  Polish seen (added to the list below): the picker's "Couldn't load your cloud profiles" banner keeps the
+  `CREDENTIALS_FILE:` code (`cleanErr` strips `[S3]` only) and stays on screen after the path is fixed and
+  saved, until some other message replaces it; the dead-proxy error shows reqwest's raw chain ("error sending
+  request: client error (Connect): tunnel error: … Connection refused (os error 61)").
 - **Found in the test review (2026-10-13, open):**
   - *A profile restored from the bucket has no `cloud_server` row.* Restore links a server only when the
     transport has one (`transport.server()`), and `profile_server()` reads a missing row as "linked to Submarine
@@ -203,16 +233,15 @@ is refused on every platform; names are still kept and matched exactly as typed.
   the telemetry FAQ. `cloud.rs` header now describes record-level sync and points at `sync_backend.rs`.
   Written ahead of step 7, so re-check the setup steps against the GUI during E2E.
 
-## Resume here (2026-10-13, after the test review)
+## Resume here (2026-10-13, after the 13.10 re-run)
 
-- **PR #1 is merged** into the fork's `main` (`0aa5820`). The test review (step 14) is PR #2, tests run
-  and green (14.5); ready to merge. Upstream has moved on since `75678e5` (11 fixes on 2026-10-13, three
-  files conflict either way) — parked, not needed for anything here.
-- **Next, in order:** merge PR #2 → rebuild the two
-  test copies (`docs/manual-tests.md` §0) → re-run the key manual tests on the merged code: 1–3, 6, 8, 9,
-  10.1, 11, 12 (13.10) → design calls: "Delete from cloud" vs. a device that still has the profile open, and
-  the two items under "Found in the test review" → §13 Mac + Linux acceptance → not run yet: §7, §8.1, §8.6
-  → 14.6 → polish list.
+- **PR #1 and PR #2 are merged** into the fork's `main` (`e3cc909`); the manual re-run on that code passed
+  (13.10, progress note above). Upstream has moved on since `75678e5` (11 fixes on 2026-10-13, three files
+  conflict either way) — parked, not needed for anything here.
+- **Next, in order:** confirm the §12 cleanup (bucket folder empty, e2e app data removed) → design calls:
+  "Delete from cloud" vs. a device that still has the profile open, and the two items under "Found in the
+  test review" → §13 Mac + Linux acceptance → not run yet: §5, §6.3, §7, §8.1, §8.6–8.7, §10.2–10.3 (need
+  MinIO / a self-hosted server) → 14.6 → polish list (the two 13.10 items are small UI fixes).
 - Upstream's archive tests fail on macOS (see step 13 note) — report upstream or ignore; not this PR's.
 - Screenshots `Image1–9.png` in the repo root are untracked and show the bucket/host — never commit them.
 
