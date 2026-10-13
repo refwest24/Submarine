@@ -92,8 +92,9 @@ Shared profiles stay on the HTTP cloud.
         `s3_transport`; `expand_home`; restore refusals vs faults (`restore_was_refused`). The first, second
         and last needed a small pure helper split out of the command code
   - [x] 14.4 `CLAUDE.md` added for agent sessions (toolchain, CRLF rule, test commands, what never to commit)
-  - [ ] 14.5 Run `cargo test --lib` on the branch (the review ran from a sandbox without Rust): expect
-        5 new tests green; fix anything red; `npm run typecheck`/`build`
+  - [x] 14.5 Run `cargo test --lib` on the branch (the review ran from a sandbox without Rust): 264 passed,
+        7 failed — all `archive::tests::sh_runs::*` (upstream's macOS `tar`/`unzip` failures), so the 5 new
+        tests are green; `npm run typecheck`/`build` clean (user, 2026-10-13)
   - [ ] 14.6 Still untested after this (next, in order): region auto-discovery and 503 retry/backoff and
         `NETWORK` vs `ENDPOINT_UNREACHABLE` (need a local mock HTTP server); S3 client goes through the Cloud
         panel proxy (only `build_client` is tested); `list_profiles` skipping empty partitions and the 8 MiB
@@ -204,9 +205,10 @@ is refused on every platform; names are still kept and matched exactly as typed.
 
 ## Resume here (2026-10-13, after the test review)
 
-- **PR #1 is merged** into the fork's `main` (`0aa5820`). The test review (step 14) is on branch
-  `fix/test-review-after-upstream-merge` as PR #2; its new Rust tests have not been run yet (14.5).
-- **Next, in order:** 14.5 on the Mac (`cargo test --lib`, typecheck, build) → merge PR #2 → rebuild the two
+- **PR #1 is merged** into the fork's `main` (`0aa5820`). The test review (step 14) is PR #2, tests run
+  and green (14.5); ready to merge. Upstream has moved on since `75678e5` (11 fixes on 2026-10-13, three
+  files conflict either way) — parked, not needed for anything here.
+- **Next, in order:** merge PR #2 → rebuild the two
   test copies (`docs/manual-tests.md` §0) → re-run the key manual tests on the merged code: 1–3, 6, 8, 9,
   10.1, 11, 12 (13.10) → design calls: "Delete from cloud" vs. a device that still has the profile open, and
   the two items under "Found in the test review" → §13 Mac + Linux acceptance → not run yet: §7, §8.1, §8.6
