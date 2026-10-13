@@ -76,6 +76,32 @@ Shared profiles stay on the HTTP cloud.
         PR #1 shows only this branch's changes
   - [ ] 13.10 User re-runs the key manual checks on fresh test copies
 
+- [ ] 14. Test review after the upstream merge (2026-10-13, branch `fix/test-review-after-upstream-merge`, PR #2)
+  - [x] 14.1 `docs/manual-tests.md` corrected where it disagreed with the code: §9.4 (HTTP + signed out hides
+        **Sync now**, no "not signed in" toast), §10.1 (dead proxy → `ENDPOINT_UNREACHABLE` after retries, not
+        `NETWORK`; the **Change** step and the **None** proxy choice), §10.3 (the real warning text; restored
+        profiles don't link), the secrets grep (it matched the `[redacted private key]` placeholder and four
+        harmless SSH lines, so it failed exactly when redaction worked), the `it_` filter note, log-level
+        spacing in every quote (`INFO  [`, `WARN  [`), §1 and §6.3 details, the log-area list
+  - [x] 14.2 Code: `handleCloudSync` classifies `[S3]` errors before the sign-in check and matches `401` as a
+        word (a bucket error carrying "401" inside an id or path was reported as "not signed in"); config
+        load/save errors no longer log as `[S3] [S3] …`; the applog fixture uses the decision-8 message
+  - [x] 14.3 Tests written (not yet run — see 14.5): the server gate skips the link for a bucket and leaves
+        the row alone (`gate_profile_server`, lib.rs); `personal_sync_ready` keeps S3 ready with an unreadable
+        credentials file; a missing / key-less credentials file is a `CREDENTIALS_FILE` error from
+        `s3_transport`; `expand_home`; restore refusals vs faults (`restore_was_refused`). The first, second
+        and last needed a small pure helper split out of the command code
+  - [x] 14.4 `CLAUDE.md` added for agent sessions (toolchain, CRLF rule, test commands, what never to commit)
+  - [x] 14.5 Run `cargo test --lib` on the branch (the review ran from a sandbox without Rust): 264 passed,
+        7 failed — all `archive::tests::sh_runs::*` (upstream's macOS `tar`/`unzip` failures), so the 5 new
+        tests are green; `npm run typecheck`/`build` clean (user, 2026-10-13)
+  - [ ] 14.6 Still untested after this (next, in order): region auto-discovery and 503 retry/backoff and
+        `NETWORK` vs `ENDPOINT_UNREACHABLE` (need a local mock HTTP server); S3 client goes through the Cloud
+        panel proxy (only `build_client` is tested); `list_profiles` skipping empty partitions and the 8 MiB
+        body cap; the name rule at its 5 call sites; escrow kept across GC and removed with the profile;
+        `profile_sync_stats` comparable flag; `view()` with a missing file. Frontend: no test runner at all —
+        decide whether to add vitest for `buildRows`, `nameProblem`, `handleCloudSync`, `cleanErr`
+
 Decision (9.3, user 2026-10-05), **superseded 2026-10-12**: names that differ only in case were allowed where the
 disk is case-sensitive. Now (decision 8, step 13.5): a new name matching an existing profile in any letter case
 is refused on every platform; names are still kept and matched exactly as typed.
@@ -141,6 +167,16 @@ is refused on every platform; names are still kept and matched exactly as typed.
     "bucket doesn't exist" message stays under the form after the bucket name is corrected; Settings shows
     the can't-read warning and a green "Saved — personal profiles now sync" together; the picker hides
     cloud profiles with no live items, so an empty profile never shows In cloud.
+- **Found in the test review (2026-10-13, open):**
+  - *A profile restored from the bucket has no `cloud_server` row.* Restore links a server only when the
+    transport has one (`transport.server()`), and `profile_server()` reads a missing row as "linked to Submarine
+    Cloud". Switch such an install to a self-hosted sync server and that profile refuses with `OTHER_SERVER`
+    instead of linking on its first sync like a profile created on the device. Fix candidates: write an empty
+    `cloud_server` row on restore (= "link on first HTTP sync"), or treat a missing row as unlinked when the
+    profile has `cloud_profile` set.
+  - *Decision 8 isn't enforced against empty cloud profiles:* the picker filters `live_records > 0` before the
+    name check, and the backend checks the local disk only. An empty cloud `E2e` doesn't block a new local `e2e`.
+    Either check names against the unfiltered cloud list, or have the backend list the bucket's names on create.
 - **Step 13 (2026-10-12): upstream merged in.** Upstream main `75678e5` (77 commits) merged into this branch
   (merge commit, no rebase). Conflicts: Cargo.toml/lock (upstream's lock + 5 edges, no new crates; `hmac` 0.13
   for sha2 0.11; `async-trait` kept as a direct dep), lib.rs (19 blocks, CRLF kept), tunnel.rs, and four UI
@@ -167,13 +203,16 @@ is refused on every platform; names are still kept and matched exactly as typed.
   the telemetry FAQ. `cloud.rs` header now describes record-level sync and points at `sync_backend.rs`.
   Written ahead of step 7, so re-check the setup steps against the GUI during E2E.
 
-## Resume here (2026-10-12, after step 13)
+## Resume here (2026-10-13, after the test review)
 
-- **Upstream is merged into this branch** (PR #1 on the fork). Pushed together with the fork's `main`
-  fast-forwarded to upstream `75678e5`, so PR #1 shows only this branch's changes.
-- **Next, in order:** rebuild the two test copies (`docs/manual-tests.md` §0) → re-run the key manual tests
-  on the merged code: 1–3, 6, 8, 9, 10.1, 11, 12 → design call on "Delete from cloud" vs. a device that still
-  has the profile open → §13 Mac + Linux acceptance → not run yet: §7, §8.1, §8.6 → polish list.
+- **PR #1 is merged** into the fork's `main` (`0aa5820`). The test review (step 14) is PR #2, tests run
+  and green (14.5); ready to merge. Upstream has moved on since `75678e5` (11 fixes on 2026-10-13, three
+  files conflict either way) — parked, not needed for anything here.
+- **Next, in order:** merge PR #2 → rebuild the two
+  test copies (`docs/manual-tests.md` §0) → re-run the key manual tests on the merged code: 1–3, 6, 8, 9,
+  10.1, 11, 12 (13.10) → design calls: "Delete from cloud" vs. a device that still has the profile open, and
+  the two items under "Found in the test review" → §13 Mac + Linux acceptance → not run yet: §7, §8.1, §8.6
+  → 14.6 → polish list.
 - Upstream's archive tests fail on macOS (see step 13 note) — report upstream or ignore; not this PR's.
 - Screenshots `Image1–9.png` in the repo root are untracked and show the bucket/host — never commit them.
 
@@ -228,7 +267,8 @@ Re-run the Linode integration tests any time (throwaway `submarine-it/<id>/` pre
 - Commands `sync_backend_get`/`set`, `s3_test_connection`; `SyncStorageSection` UI in CloudPanel + Settings;
   personal sync gated on the active backend (S3: a bucket is set), sharing still on sign-in; sync failures
   shown in the Profile panel as well as the Activity Log.
-- Profile names are case-sensitive (step 9); `applog.rs` writes a redacted `submarine.log` (step 12);
+- Profile names are kept exactly as typed but a new name matching an existing one in any letter case is
+  refused (steps 9 and 13.5, decision 8); `applog.rs` writes a redacted `submarine.log` (step 12);
   `docs/manual-tests.md` holds the manual test procedure.
 
 **Verified.** 75 Rust tests pass (2026-10-12), including two-device scenarios on an in-memory store and the 3

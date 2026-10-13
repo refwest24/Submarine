@@ -421,17 +421,19 @@ function DesktopApp() {
     } catch (e) {
       const msg = String(e);
       let text: string;
-      if (/NOT_SIGNED_IN|NO_TOKEN|invalid_token|Missing auth|401/i.test(msg)) {
+      // Bucket errors first: a bucket needs no sign-in, and its messages carry
+      // ids and paths that could otherwise look like an HTTP 401 below.
+      if (/^\[S3\] (NOT_CONFIGURED|CREDENTIALS_FILE|CONFIG_INVALID)/.test(msg)) {
+        text = `Sync storage isn't set up: ${msg.replace(/^\[S3\] [A-Z_]+:\s*/, "")} — fix it in Settings → Cloud Sync.`;
+      } else if (msg.startsWith("[S3]")) {
+        text = `Sync to your bucket failed: ${msg.replace(/^\[S3\] [A-Z_]+:\s*/, "")}`;
+      } else if (/NOT_SIGNED_IN|NO_TOKEN|invalid_token|Missing auth|\b401\b/i.test(msg)) {
         text = "Cloud sync: not signed in. Open the Cloud panel from the profile picker and sign in first.";
       } else if (/NO_PROFILE_OPEN|DB_NOT_OPEN|NO_KEY|NO_HLC/i.test(msg)) {
         text = "Cloud sync: no profile open — unlock a profile first.";
       } else if (/^\[SYNC\] (OTHER_SERVER|SHARED_PROFILE|SHARE_CHANGED):/.test(msg)) {
         // Already a sentence for the user; only the code goes.
         text = `Cloud sync: ${msg.replace(/^\[SYNC\] [A-Z_]+:\s*/, "")}`;
-      } else if (/^\[S3\] (NOT_CONFIGURED|CREDENTIALS_FILE|CONFIG_INVALID)/.test(msg)) {
-        text = `Sync storage isn't set up: ${msg.replace(/^\[S3\] [A-Z_]+:\s*/, "")} — fix it in Settings → Cloud Sync.`;
-      } else if (msg.startsWith("[S3]")) {
-        text = `Sync to your bucket failed: ${msg.replace(/^\[S3\] [A-Z_]+:\s*/, "")}`;
       } else {
         text = `Cloud sync failed: ${msg}`;
       }

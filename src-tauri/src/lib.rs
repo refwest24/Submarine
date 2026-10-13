@@ -1377,6 +1377,18 @@ fn link_profile_server(conn: &Connection, base: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The check a sync runs before anything goes out, given the server it is
+/// about to talk to. A bucket (`None`) is tied to no server (decision
+/// 2026-10-12): nothing is checked, and a `cloud_server` row left from an
+/// earlier HTTP life is neither read nor changed. Returns whether the profile
+/// is still unlinked, as `check_profile_server` does.
+fn gate_profile_server(conn: &Connection, server: Option<&str>) -> Result<bool, String> {
+    match server {
+        Some(base) => check_profile_server(conn, base),
+        None => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod profile_server_tests {
     use super::*;
@@ -1414,6 +1426,25 @@ mod profile_server_tests {
         link_profile_server(&conn, cloud::CLOUD_API_BASE).unwrap();
         assert_eq!(check_profile_server(&conn, cloud::CLOUD_API_BASE), Ok(false));
         assert!(check_profile_server(&conn, OWN).is_err());
+    }
+
+    // A personal profile syncing through a bucket is tied to no server, so a
+    // link to some other server - from before the install moved to S3 - is
+    // neither an obstacle nor touched. Over HTTP the same row still bites.
+    #[test]
+    fn a_bucket_sync_skips_the_server_link_and_leaves_it_alone() {
+        let conn = meta();
+        link_profile_server(&conn, OWN).unwrap();
+        assert_eq!(gate_profile_server(&conn, None), Ok(false));
+        assert_eq!(profile_server(&conn).as_deref(), Some(OWN), "the row is left as it was");
+        let err = gate_profile_server(&conn, Some(cloud::CLOUD_API_BASE)).unwrap_err();
+        assert!(err.starts_with("[SYNC] OTHER_SERVER"), "{err}");
+        // Never linked at all: a bucket sync doesn't link it either.
+        let fresh = meta();
+        fresh.execute("INSERT INTO sync_meta(key,value) VALUES('cloud_server','')", []).unwrap();
+        assert_eq!(gate_profile_server(&fresh, None), Ok(false));
+        assert_eq!(profile_server(&fresh), None);
+        assert_eq!(gate_profile_server(&fresh, Some(OWN)), Ok(true), "HTTP would link on this first sync");
     }
 }
 
@@ -1489,13 +1520,10 @@ async fn sync_with_inner(
     // Checked before anything goes out, the shared key refresh below included:
     // a server the profile isn't linked to could hand back a key it knows,
     // and every record pushed after that would be readable to it.
-    let unlinked = match server {
-        Some(base) => {
-            let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
-            let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
-            check_profile_server(conn, base)?
-        }
-        None => false,
+    let unlinked = {
+        let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+        let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+        gate_profile_server(conn, server)?
     };
 
     // A shared profile's key can change under us: the owner rotates it whenever
@@ -2226,13 +2254,18 @@ async fn restore_personal_profile(
         restore_personal_profile_inner(app, db_state, cloud, cloud_profile, local_name, vault_password).await;
     match &result {
         Ok(r) => applog::info("SYNC", format!("restored {what}: pulled {}", r.pulled)),
-        // A wrong password or a taken name is the user's input being refused, not a fault.
-        Err(e) if e.contains("ESCROW_UNSEAL_FAILED") || e.starts_with("Can't use '") || e.ends_with("already exists") => {
-            applog::warn("SYNC", format!("restore of {what} refused: {e}"))
-        }
+        Err(e) if restore_was_refused(e) => applog::warn("SYNC", format!("restore of {what} refused: {e}")),
         Err(e) => applog::error("SYNC", format!("restore of {what} failed: {e}")),
     }
     result
+}
+
+/// Whether a failed restore was the user's own input being turned down (a
+/// wrong password, a name already in use) rather than a fault. The log shows
+/// the first as a warning, the second as an error, so a log full of typos
+/// doesn't read like a broken sync.
+fn restore_was_refused(error: &str) -> bool {
+    error.contains("ESCROW_UNSEAL_FAILED") || error.starts_with("Can't use '") || error.ends_with("already exists")
 }
 
 async fn restore_personal_profile_inner(
@@ -15461,6 +15494,29 @@ mod tests {
             assert_eq!(ensure_profile_name_free(&dir, "E2e"), Err("Profile 'E2e' already exists".into()));
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The refusals a restore can produce are logged as WARN "refused"; a real
+    // failure (no escrow, a network error, a broken config) as ERROR "failed".
+    #[test]
+    fn a_restore_refused_for_the_users_input_is_a_warning_not_a_fault() {
+        let dir = std::env::temp_dir().join(format!("submarine-restore-{}", new_entity_uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("E2e.submarine"), b"x").unwrap();
+        let clash = ensure_profile_name_free(&dir, "e2e").unwrap_err();
+        let taken = ensure_profile_name_free(&dir, "E2e").unwrap_err();
+        fs::remove_dir_all(&dir).unwrap();
+        for refused in ["[SYNC] ESCROW_UNSEAL_FAILED: wrong password for this profile", clash.as_str(), taken.as_str()] {
+            assert!(restore_was_refused(refused), "{refused}");
+        }
+        for failed in [
+            "[SYNC] NO_ESCROW: no restorable copy of that profile in your cloud. Open it on the original device and sync once, then try again.",
+            "[S3] CREDENTIALS_FILE: can't read /x/missing: No such file or directory (os error 2)",
+            "[S3] ENDPOINT_UNREACHABLE: connection refused",
+            "[CLOUD] NOT_SIGNED_IN",
+        ] {
+            assert!(!restore_was_refused(failed), "{failed}");
+        }
     }
 
     #[test]

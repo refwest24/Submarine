@@ -25,7 +25,9 @@ cd .. && npm ci && npm run typecheck && npm run build     # npm ci after pulling
 
 - Without `SUBMARINE_S3_IT=1` the three live tests (`it_store_…`, `it_connection_test_…`,
   `it_two_devices_converge_…`) return early and still print `ok` — check they took seconds, not
-  milliseconds. The `it_` filter also matches two offline tests (`edit_…`), so it reports 5.
+  milliseconds. The `it_` filter matches any test whose full path contains it (`edit_`, `bit_`,
+  `live_edit_tests::`, …), so expect several extra offline tests in the run; the three above are the ones
+  that matter.
 - `a_profile_name_taken_in_any_letter_case_is_refused` checks the name rule (test 8) on whatever disk the temp
   folder is on; on a case-sensitive one it also checks that an exact name wins over a case variant left from
   before the rule. To run that part on a Mac, use a case-sensitive disk image:
@@ -63,18 +65,23 @@ own: `~/Library/Logs/com.submarine.e2e.a/submarine.log` (and `…e2e.b…`) for 
 tail -f ~/Library/Logs/com.submarine.e2e.a/submarine.log
 ```
 
-Lines look like `2026-10-05T23:59:59.123Z WARN  [S3] retrying after: …`. Areas: `APP`, `SYNC`, `S3`, `PROFILE`,
-`PICKER`, `ACTIVITY` (everything the Activity Log shows), `SSH`, `SFTP`, `TUNNEL`, `MONITOR`, `SHARE`, `DATABASE`.
+Lines look like `2026-10-05T23:59:59.123Z WARN  [S3] retrying after: …` — the level is padded to five characters,
+so `INFO` and `WARN` are followed by two spaces and `ERROR` by one (the quotes below are written that way; copy them
+as they are when grepping). Areas: `APP`, `SYNC`, `S3`, `PROFILE`, `PICKER`, `ACTIVITY` (everything the Activity
+Log shows), `SSH`, `SFTP`, `TUNNEL`, `MONITOR`, `SHARE`, `DATABASE`, and `UI` for anything the app logs
+without naming an area.
 In portable mode the file is in `submarine-data/logs/`, and the first lines after `APP … started` say so.
 
 **Secrets check — after every run, this must print nothing:**
 
 ```sh
-grep -iE 'PRIVATE KEY|Private-Lines|secret_key *[:=] *[^[ ]|Signature=[0-9a-f]|Bearer [^[]|password *[:=] *[^[ ]' \
+grep -iE -- '-----BEGIN [A-Z ]*PRIVATE KEY|Private-Lines|secret_key *[:=] *[^[ ]|Signature=[0-9a-f]|Bearer [^[]|password *[:=] *[^[ ]' \
   ~/Library/Logs/com.submarine.e2e.*/submarine.log
 ```
 
-and neither should a grep for the test profile passwords, the bucket's access key or any saved login's password.
+A redacted secret leaves `[redacted]` or `[redacted private key]` behind; those are fine and don't match. Neither
+should a grep for each test profile password, the bucket's access key or any saved login's password — run that
+with the real values, one at a time, before the logs are deleted in test 12.
 
 ### The app's words for things
 
@@ -109,12 +116,13 @@ On A: profile picker → **Connect cloud sync** (signed out) or the cloud bar's 
 - **Expect:** "Connected to bucket '<bucket>' at <endpoint> (region …) — write, read, list and delete all
   work." The region is whichever the server accepted (Linode may take `us-east-1` or ask for `default`).
   **Keys found** shows the endpoint. After Save: "Saved — personal profiles now sync through your bucket.";
-  the picker's cloud bar shows `<bucket>/<folder>` and **S3 bucket** (**S3 bucket · Needs setup** while the
-  credentials file can't be read).
-- **Check:** the bucket folder is still empty (the test object was removed); A's `sync_backend.json` holds
-  bucket, folder and file path only — no keys.
-- **Log:** `INFO [S3] connection test OK: Connected to bucket …`, then `INFO [S3] sync storage set to bucket
-  '<bucket>', folder '<folder>', credentials file <cfg>`. If the server asked for another region: `INFO [S3]
+  once the panel is closed, the picker's cloud bar shows `<bucket>/<folder>` and **S3 bucket** (**S3 bucket ·
+  Needs setup** while the credentials file can't be read).
+- **Check:** the bucket folder is still empty (the test object was removed); A's `sync_backend.json` holds the
+  backend, bucket, `prefix` (the folder), the credentials file path and the endpoint/region/path-style
+  settings — no keys.
+- **Log:** `INFO  [S3] connection test OK: Connected to bucket …`, then `INFO  [S3] sync storage set to bucket
+  '<bucket>', folder '<folder>', credentials file <cfg>`. If the server asked for another region: `INFO  [S3]
   server wants region 'default', not 'us-east-1' — retrying with it`.
 
 ## 2. First sync, with a saved login
@@ -124,8 +132,8 @@ On A: **New profile** (type the name in lower case, e.g. `e2e`) → add a server
 **Sync now**.
 
 - **Expect:** "Last synced <time>".
-- **Log:** `INFO [PROFILE] created profile 'e2e'`, then `INFO [SYNC] 'e2e' synced: pushed N, pulled 0 (… ms)`
-  for each sync (auto-sync included) and `INFO [ACTIVITY] Cloud sync complete — …`.
+- **Log:** `INFO  [PROFILE] created profile 'e2e'`, then `INFO  [SYNC] 'e2e' synced: pushed N, pulled 0 (… ms)`
+  for each sync (auto-sync included) and `INFO  [ACTIVITY] Cloud sync complete — …`.
 - **Bucket:** one new `<profile-id>/` folder with `escrow/…`, `meta.json` (the name exactly as typed),
   `r/credentials/…` and `r/servers/…`. Editing a record again adds a second version; the old one stays.
 
@@ -143,8 +151,8 @@ from cloud** if not).
 4. Back on the picker, a wrong password on the now-local copy says "Wrong password."
 5. **Bucket:** one more `escrow/…` object (each restore makes a new local vault with its own salt); no
    records uploaded again.
-6. **Log:** `WARN [SYNC] restore of '<name>' from cloud profile <id> refused: … ESCROW_UNSEAL_FAILED …` for
-   step 1; `INFO [SYNC] restored '<name>' … pulled N` for step 2; `WARN [PICKER] opening '<name>' failed:
+6. **Log:** `WARN  [SYNC] restore of '<name>' from cloud profile <id> refused: … ESCROW_UNSEAL_FAILED …` for
+   step 1; `INFO  [SYNC] restored '<name>' … pulled N` for step 2; `WARN  [PICKER] opening '<name>' failed:
    wrong password` for step 4. The passwords themselves never appear.
 
 ## 4. Edits and deletes travel both ways
@@ -170,10 +178,11 @@ Use **Settings → Cloud Sync → Profile sync storage** on one device.
 2. **Missing credentials file during a sync:** Credentials file `~/.config/submarine-sync/missing` →
    **Save** (**Keys found** turns into a warning) → **Profile** → **Sync now**. **Expect:** a readable error
    in the panel, and the same error in the **Activity Log**. Restore the path → **Save** → **Sync now** works.
-3. **Log:** for 1, `WARN [S3] connection test for bucket '<bucket>-nope', folder '<folder>' failed: [S3] …`;
+3. **Log:** for 1, `WARN  [S3] connection test for bucket '<bucket>-nope', folder '<folder>' failed: [S3] …`;
    for 2, `ERROR [SYNC] '<name>' sync failed after … ms: [S3] CREDENTIALS_FILE: can't read …/missing: …` plus the
    `ERROR [ACTIVITY] Sync storage isn't set up: can't read …/missing: …` line. A broken `sync_backend.json` logs
-   `ERROR [S3] CONFIG_INVALID: …` and, on the picker, `WARN [PICKER] sync storage settings unreadable: …`.
+   `ERROR [S3] CONFIG_INVALID: sync_backend.json: …` and, on the picker, `WARN  [PICKER] sync storage settings
+   unreadable: …`.
 
 ## 7. Concurrent edits (optional)
 
@@ -196,8 +205,8 @@ is refused on every platform: `e2e` and `E2e` can't both be created.
    allowed (it may be that very profile).
 3. **Refused on restore:** **Get on this device** of a cloud profile `e2e` while the device has `E2e`.
    **Expect:** "Can't use 'e2e': you already have a profile called 'E2e', and names that differ only in
-   letter case aren't allowed. Pick another name." **Log:** `WARN [PROFILE] Can't use 'e2e': …` and
-   `WARN [SYNC] restore of 'e2e' … refused: …`.
+   letter case aren't allowed. Pick another name." **Log:** `WARN  [PROFILE] Can't use 'e2e': …` and
+   `WARN  [SYNC] restore of 'e2e' … refused: …`.
    To set this up now that the picker refuses it: create `E2e` on B **before** B's storage is set up (so B
    can't see A's `e2e`), add a server, then set up storage and sync.
 4. **Separate rows:** in that setup B lists `E2e` (**On this device · Synced**) and `e2e` (**In your cloud**)
@@ -222,42 +231,48 @@ Both copies signed out (Cloud panel shows **Sign in**), storage on **S3 bucket**
 2. **Get on this device** on B works signed out (test 3), and its Profile panel says "Everything is in sync
    with your bucket."
 3. **Delete from cloud** works signed out (test 12).
-4. Storage back to **Sync server** while signed out → **Sync now**. **Expect:** "Cloud sync: not signed in…"
-   (the sync server still needs an account). Back to **S3 bucket**.
-5. **Log:** `INFO [SYNC] '<name>' synced: …` lines and no `[CLOUD] NOT_SIGNED_IN` while on S3.
+4. Storage back to **Sync server** while signed out → **Profile** panel. **Expect:** **Sync now** is gone and the
+   panel says "Not signed in — lock this profile and sign in from the Cloud button on the picker." (the sync
+   server still needs an account). Auto-sync keeps trying quietly and logs `ERROR [SYNC] '<name>' sync failed
+   after … ms: [CLOUD] NOT_SIGNED_IN`. Back to **S3 bucket**: **Sync now** returns.
+5. **Log:** `INFO  [SYNC] '<name>' synced: …` lines and no `[CLOUD] NOT_SIGNED_IN` while on S3.
 
 ## 10. Sync server and proxy settings
 
-1. **Proxy applies to the bucket:** Cloud panel → **Sync server** (default) → **Proxy** → **Manual**
-   `http://127.0.0.1:9` (nothing listens there) → **Save** → storage **Test connection**. **Expect:** a network
-   error, not "Connected". **Sync now** fails with "Sync to your bucket failed: …". Proxy back to **System**
-   → both work again. **Log:** `WARN [S3] connection test … failed: [S3] NETWORK: …`.
+1. **Proxy applies to the bucket:** Cloud panel → **Sync server:** line → **Change** → **Proxy** → **Manual**
+   `http://127.0.0.1:9` (nothing listens there) → **Save** → storage **Test connection**. **Expect:** an
+   "endpoint unreachable" error after a few seconds of retries, not "Connected". **Sync now** fails with "Sync
+   to your bucket failed: …". Proxy back to **System** → both work again. **Log:** four `WARN  [S3] retrying
+   after: [S3] ENDPOINT_UNREACHABLE: …` lines, then `WARN  [S3] connection test … failed: [S3]
+   ENDPOINT_UNREACHABLE: …`. (`[S3] NETWORK:` is reserved for failures that are neither a refused connection
+   nor a timeout.)
 2. **A bucket endpoint on this machine is never proxied** (only with a local MinIO at `http://127.0.0.1:9000`):
    with the dead proxy above, **Test connection** to it still works.
 3. **Another sync server doesn't touch bucket profiles** (needs a reachable self-hosted server): set it in the
-   Cloud panel. **Expect:** S3 profiles keep syncing to the bucket with no "syncs with another server"
-   warning. Switch storage to **Sync server** and sign in: a profile that synced with the old server shows
-   upstream's warning and **Sync with …** button; one never synced over HTTP links to the new server on its
-   first sync. Set everything back.
+   Cloud panel. **Expect:** S3 profiles keep syncing to the bucket, with no "This profile syncs with …, not with
+   …" warning. Switch storage to **Sync server** and sign in: a profile that synced with the old server shows
+   that warning and the **Sync with …** button; one **created on this device** and never synced over HTTP links
+   to the new server on its first sync. A profile that reached this device by **Get on this device** from the
+   bucket behaves as if linked to Submarine Cloud instead (see "Known open issues"). Set everything back.
 
 ## 11. Profile picker
 
 1. Click a row, type the password, **Unlock**. **Expect:** that profile opens (never another of a similar
-   name). Wrong password: "Wrong password." under the box, `WARN [PICKER] opening '<name>' failed: wrong
+   name). Wrong password: "Wrong password." under the box, `WARN  [PICKER] opening '<name>' failed: wrong
    password` in the log.
 2. **⋯** on each kind of row (**On this device**, **On this device · Synced**, **In your cloud**) — also by
    right-click and from the keyboard. **Expect:** the menu belongs to that row: **Remove from this device…**
    only on rows on this device, **Get on this device…** only on **In your cloud** rows, **Delete from
    cloud…** on rows with a cloud copy.
 3. **Refresh from cloud** fails readably with a broken credentials file (test 6.2's path), and the log has
-   `WARN [PICKER] …`.
+   `WARN  [PICKER] …`.
 
 ## 12. Delete from cloud and clean up
 
 1. Picker → each test profile → **⋯** → **Delete from cloud…** → confirm. Quit the other copy first: a copy
    that still has the profile open uploads it again on its next sync (known open issue).
    **Expect:** `Removed "<name>" from the cloud (N records).` **Bucket:** `<folder>/` is empty.
-   **Log:** `INFO [SYNC] deleted cloud profile <id> (N records)` per profile.
+   **Log:** `INFO  [SYNC] deleted cloud profile <id> (N records)` per profile.
 2. Run the secrets check above on both log files.
 3. Quit both copies and remove their data:
    `~/Library/{Application Support,Caches,WebKit,Logs}/com.submarine.e2e.{a,b}`.
@@ -283,5 +298,12 @@ script — keep its last copy in the bucket as a backup.
   markers, edits show "unattributed" without a cloud account.
 - **Delete from cloud** is undone by any device that still has the profile open: its next sync uploads it
   again. Needs a design decision.
+- A profile that came to a device by **Get on this device** from a bucket has no sync-server link (`cloud_server`
+  row) at all, and no row counts as "linked to Submarine Cloud". Move such a device to a self-hosted sync server
+  and the profile refuses to sync there ("This profile syncs with …, not with …") instead of linking on its
+  first sync, as a profile created on the device would. Found 2026-10-13 in a code review; not reproduced.
+- The any-letter-case name rule (test 8) is enforced against cloud names by the picker, which first drops
+  cloud profiles with no live items. So an empty cloud profile `E2e` doesn't stop a new local `e2e`; only the
+  on-disk check runs then. Found 2026-10-13 in a code review.
 - Upstream's archive tests (`archive::tests::sh_runs::…`) fail on macOS with "Abort trap: 6" from the
   system `tar`/`unzip`, on upstream's own code too.
