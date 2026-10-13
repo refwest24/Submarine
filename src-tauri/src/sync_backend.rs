@@ -122,9 +122,15 @@ pub fn load_config(app: &tauri::AppHandle) -> Result<BackendConfig, String> {
         Err(e) => Err(format!("[S3] CONFIG_INVALID: {CONFIG_FILENAME}: {e}")),
     }
     .map_err(|e| {
-        crate::applog::error("S3", &e);
+        log_error(&e);
         e
     })
+}
+
+/// Errors from this module already carry their `[S3]` tag; the log line adds
+/// the area, so the tag is dropped there or it would show twice.
+fn log_error(e: &str) {
+    crate::applog::error("S3", e.strip_prefix("[S3] ").unwrap_or(e));
 }
 
 /// Write via temp file + rename so a crash can't leave a half-written config
@@ -186,8 +192,18 @@ pub fn validate_s3(s: &S3Settings) -> Result<S3Settings, String> {
 /// readable `CREDENTIALS_FILE` error instead of looking never set up. An
 /// unreadable config counts as S3-not-ready (only S3 setups write it).
 pub async fn personal_sync_status(app: &tauri::AppHandle, cloud: &CloudState) -> (Backend, bool) {
-    match load_config(app) {
-        Ok(cfg) if cfg.backend == Backend::Http => (Backend::Http, cloud.status().await.signed_in),
+    let cfg = load_config(app);
+    let signed_in = match &cfg {
+        Ok(cfg) if cfg.backend == Backend::Http => cloud.status().await.signed_in,
+        _ => false,
+    };
+    personal_sync_ready(cfg, signed_in)
+}
+
+/// The rule behind `personal_sync_status`, with the two inputs it needs.
+fn personal_sync_ready(cfg: Result<BackendConfig, String>, signed_in: bool) -> (Backend, bool) {
+    match cfg {
+        Ok(cfg) if cfg.backend == Backend::Http => (Backend::Http, signed_in),
         Ok(cfg) => (Backend::S3, !cfg.s3.bucket.trim().is_empty()),
         Err(_) => (Backend::S3, false),
     }
@@ -234,7 +250,7 @@ pub async fn sync_backend_set(app: tauri::AppHandle, config: BackendConfig) -> R
         Backend::Http => config,
     };
     save_config(&app, &cfg).map_err(|e| {
-        crate::applog::error("S3", &e);
+        log_error(&e);
         e
     })?;
     match cfg.backend {
@@ -407,6 +423,50 @@ mod tests {
         let settings = S3Settings { credentials_file: file.to_string_lossy().into_owned(), ..s3("bk", "submarine/sync") };
         let transport = s3_transport(&settings, &Default::default()).unwrap();
         assert_eq!(transport.server(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Sync stays offered on S3 as soon as a bucket is set: a credentials file
+    // that can't be read must surface as a readable error at sync time, not as
+    // "never set up" (bug fixed 2026-10-12). HTTP follows the sign-in.
+    #[test]
+    fn s3_is_ready_with_a_bucket_even_when_the_credentials_file_is_unreadable() {
+        let s3_cfg = |bucket: &str| {
+            Ok(BackendConfig {
+                backend: Backend::S3,
+                s3: S3Settings { credentials_file: "/nonexistent/s3cfg".into(), ..s3(bucket, "submarine/sync") },
+            })
+        };
+        assert_eq!(personal_sync_ready(s3_cfg("bk"), false), (Backend::S3, true));
+        assert_eq!(personal_sync_ready(s3_cfg("  "), true), (Backend::S3, false), "no bucket, nothing to sync to");
+        assert_eq!(personal_sync_ready(Err("[S3] CONFIG_INVALID: x".into()), true), (Backend::S3, false));
+        assert_eq!(personal_sync_ready(Ok(BackendConfig::default()), true), (Backend::Http, true));
+        assert_eq!(personal_sync_ready(Ok(BackendConfig::default()), false), (Backend::Http, false));
+    }
+
+    // A missing or key-less credentials file names itself in the error, with
+    // the tag the UI keys on, and nothing is contacted.
+    #[test]
+    fn an_unreadable_credentials_file_is_a_credentials_file_error() {
+        let dir = std::env::temp_dir().join(format!("submarine-nocfg-{}", crate::new_entity_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing");
+        let err = s3_transport(
+            &S3Settings { credentials_file: missing.to_string_lossy().into_owned(), ..s3("bk", "p") },
+            &Default::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(err.starts_with("[S3] CREDENTIALS_FILE: can't read ") && err.contains("missing"), "{err}");
+        let keyless = dir.join("keyless");
+        std::fs::write(&keyless, "[default]\nhost_base = 127.0.0.1:9000\n").unwrap();
+        let err = s3_transport(
+            &S3Settings { credentials_file: keyless.to_string_lossy().into_owned(), ..s3("bk", "p") },
+            &Default::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(err.starts_with("[S3] CREDENTIALS_FILE: ") && !err.contains("can't read"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

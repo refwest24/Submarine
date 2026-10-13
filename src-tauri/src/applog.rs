@@ -243,7 +243,7 @@ mod tests {
             "[S3] SIGNATURE_MISMATCH: the storage server rejected the request signature — check the secret key and the region (using 'default')",
             "[S3] ACCESS_DENIED: Access Denied — check the access key, secret key and region (using 'us-east-1'), and that the key may use bucket 'b'",
             "[SYNC] ESCROW_UNSEAL_FAILED: wrong password for this profile",
-            "Can't use 'E2e' here: this device's disk ignores letter case, so it would be the same file as your profile 'e2e'. Pick another name.",
+            "Can't use 'E2e': you already have a profile called 'e2e', and names that differ only in letter case aren't allowed. Pick another name.",
             "[S3] skipped oversized object r/servers/7111f9976d77518339992bdf603141ca/3030313739313234313036393839323a30303030303a62646561363665666666353363303630.rec (9000000 bytes)",
             "'9ce4e5a5854b1d646fd7972a46d6d8c3' synced: pushed 3, pulled 1 (412 ms)",
             "[S3] CREDENTIALS_FILE: can't read /Users/someone/.config/submarine-sync/missing: No such file or directory (os error 2)",

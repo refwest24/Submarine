@@ -499,6 +499,18 @@ impl ObjectStore for S3Store {
 mod tests {
     use super::*;
 
+    // The credentials path in the settings is typed by hand, so `~/` has to
+    // work; nothing else is rewritten.
+    #[test]
+    fn only_a_leading_tilde_slash_is_the_home_folder() {
+        if let Some(dirs) = directories::BaseDirs::new() {
+            assert_eq!(expand_home("~/.config/submarine-sync/s3cfg"), dirs.home_dir().join(".config/submarine-sync/s3cfg"));
+        }
+        assert_eq!(expand_home("/etc/s3cfg"), PathBuf::from("/etc/s3cfg"));
+        assert_eq!(expand_home("~user/s3cfg"), PathBuf::from("~user/s3cfg"));
+        assert_eq!(expand_home("s3cfg"), PathBuf::from("s3cfg"));
+    }
+
     #[test]
     fn reads_the_default_section_of_an_s3cmd_config() {
         let cfg = parse_s3cmd_config(
