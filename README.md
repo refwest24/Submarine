@@ -158,6 +158,7 @@ Manage Docker on any session host without typing a single `docker` command.
 - Save servers once, access them on every machine you own
 - The sync server hosts an opaque encrypted blob — we have no way to read it (see [Security](#security))
 - No registration. No password recovery email. Your master password never leaves your device.
+- Or skip the account and sync personal profiles through your own S3-compatible bucket (see [Sync to your own S3 bucket](#sync-to-your-own-s3-bucket))
 
 ### Productivity
 
@@ -193,7 +194,7 @@ A first portable launch starts with no profiles. To carry existing data over, cl
 - the contents of `%APPDATA%\com.submarine.app`, except `sync_device.json` — it identifies each install to cloud sync, and the portable copy creates its own;
 - the folder `%LOCALAPPDATA%\com.submarine.app\EBWebView`. It holds the app's settings, including **Auto-sync**. Without it Auto-sync starts out on, and the first profile you open is uploaded to your cloud — so if you skip this folder, turn Auto-sync off in Settings before opening a profile you keep only on this computer.
 
-`submarine-data` then holds your encrypted profiles and your cloud sign-in token, so keep it somewhere only you can read.
+`submarine-data` then holds your encrypted profiles and your cloud sign-in token, so keep it somewhere only you can read. The credentials file for [S3 sync](#sync-to-your-own-s3-bucket) stays where it is and isn't copied into `submarine-data`.
 
 Not portable: the Microsoft Edge WebView2 runtime (a Windows system component, preinstalled on Windows 11 and current Windows 10) and the short-lived temp files used while editing or dragging remote files. If `submarine-data` can't be written to, Submarine falls back to the usual per-user folders and says so in Settings. (A plain, non-packaged Linux build works the same way — it just doesn't ship a prebuilt zip.)
 
@@ -233,6 +234,48 @@ Your data is encrypted on your machine before anything leaves it. Submarine and 
 - TOFU host keys with per-connection nonce binding (resists prompt-race attacks)
 - Strict Content Security Policy, minimal Tauri permission ACL, no shell or filesystem plugins exposed to the UI
 
+## Sync to your own S3 bucket
+
+Personal profiles can sync through an S3-compatible bucket you control (Linode Object Storage, AWS S3, MinIO, Cloudflare R2, Backblaze B2) instead of the sync server (Submarine Cloud or your own). No account is needed, and a profile synced this way isn't tied to any sync server, so changing the server in the Cloud panel doesn't affect it. Shared profiles still sync through the sync server, because sharing needs the account (members, invites, sealed key grants). The choice is per install and made in the desktop apps; on Android there is no practical way to provide the credentials file yet.
+
+**1. Put the access key in an s3cmd-format file.** Submarine reads `~/.config/submarine-sync/s3cfg` by default; any path works, including an existing `~/.s3cfg`. Only the `[default]` section is read:
+
+```ini
+[default]
+access_key = YOUR_ACCESS_KEY
+secret_key = YOUR_SECRET_KEY
+# Your provider's S3 endpoint, without https:// (required unless set in the app)
+host_base = us-east-1.linodeobjects.com
+# Optional: True (default) or False
+use_https = True
+# Optional region hint: US -> us-east-1, EU -> eu-west-1, anything else as-is
+bucket_location = US
+```
+
+Keep comments on their own lines — text after a value is read as part of the value. The key needs list, read, write and delete access to the bucket.
+
+**2. Point Submarine at the bucket.** Open the Cloud panel (the cloud bar on the profile picker, or **Settings → Cloud Sync**), choose **S3 bucket** under *Profile sync storage*, and fill in the bucket and the folder inside it (default `submarine/sync`). **Endpoint and region** overrides the file's `host_base` and the detected region, and has the path-style switch (on by default, works with every provider). **Test connection** writes, reads, lists and deletes a small probe object, then **Save**. If the region is wrong the server says which one it wants and Submarine retries with it, so Ceph-based services such as Linode's work without setting one.
+
+**3. Repeat on each machine.** A new machine lists the profiles it finds in the bucket on the profile picker; unlock one with its password to restore it. After that, **Sync now** and auto-sync work exactly as with the sync server.
+
+**What's in the bucket.** Each profile gets its own folder:
+
+```text
+<folder>/<profile-id>/
+  r/<type>/<record-id>/<stamp>.rec   one object per saved version of a record (encrypted)
+  r/<type>/<record-id>/<stamp>.del   a deletion marker (empty)
+  escrow/<salt>                      the profile's data key, sealed under the profile password
+  meta.json                          {"name": "<profile name>"}
+```
+
+Record bodies are the same ciphertext the sync server would store, and the data key is only usable with the profile password. The bucket does see the key names (record type, record id, edit timestamp), object sizes and upload times, and the profile's name (in `meta.json`, and as the folder name for older profiles).
+
+**Conflicts.** Each record (a server, a credential, a tunnel…) syncs on its own, so edits to different records on different machines both survive. When two machines change the *same* record, the newer edit wins, ordered by a hybrid logical clock so wall-clock drift between machines can't reorder edits. Devices only ever add objects and never need locks, so any number of them can sync at once.
+
+**The losing edit is kept for 30 days.** A superseded version — including the loser of a conflict, which is still uploaded before the winner replaces it locally — stays in the bucket, encrypted, for 30 days after upload. After that, the next sync from any machine removes it. **Delete from cloud** on the profile picker removes the profile's whole folder.
+
+**The access key stays in its file.** Submarine reads it when a sync starts, keeps it in memory for that sync only, and never copies it anywhere. The app's own setting (`sync_backend.json` in its app-data folder) holds only the bucket, folder and file path.
+
 ## FAQ
 
 ### Is Submarine free?
@@ -263,9 +306,13 @@ Smaller installer (around 10 MB vs ~100 MB for an Electron equivalent), lower RA
 
 In a single encrypted file under your OS app-data directory — or in the `submarine-data` folder when you run in [portable mode](#portable-mode-windows). Nothing in plaintext. Nothing in a global Keychain or registry hive.
 
+### Where are the logs?
+
+In `submarine.log` in your OS log folder: `~/Library/Logs/<app id>/` on macOS, `~/.local/share/<app id>/logs/` on Linux, `%LOCALAPPDATA%\<app id>\logs\` on Windows, or `submarine-data\logs\` in [portable mode](#portable-mode-windows) (**Settings → Activity Log** shows the exact path). It records what the Activity Log shows plus sync, storage, profile and connection events and errors, one line each with a UTC timestamp. It stays on your machine, is readable only by you, is capped at about 2 MB, and passwords, keys and tokens are kept out of it.
+
 ### Does Submarine collect telemetry or analytics?
 
-No. There's no analytics SDK, no crash reporter that sends data home, no "phone home" call on launch. The only outbound network call beyond your SSH targets is the optional cloud-sync endpoint at `api.sinaxhpm.com`, and that endpoint only ever receives opaque ciphertext.
+No. There's no analytics SDK and no crash reporter that sends data home. Beyond your SSH targets, Submarine talks to the sync server when you use cloud sync (`submarine.sinaxhpm.com` by default, or your own), to your own bucket if you choose S3 sync storage, and to GitHub's release API when the profile picker checks for a newer version. The sync server and the bucket only ever receive opaque ciphertext.
 
 ### Can I use Submarine on my Android phone with the same servers as my desktop?
 
@@ -286,6 +333,8 @@ npm install
 npm run tauri dev          # run in development
 npm run tauri build        # build release bundle
 ```
+
+Tests: `cargo test --lib` in `src-tauri`, `npm run typecheck`, and the click-through checks for sync, S3 storage and profile names in [docs/manual-tests.md](docs/manual-tests.md).
 
 ### Android build
 

@@ -542,7 +542,11 @@ async fn run_poller(
                 let _ = app.emit(&format!("monitor-sample-{}", node_id), sample);
             }
             Err(e) => {
-                eprintln!("[monitor] poll failed for node {}: {}", node_id, e);
+                // Once per outage, not once per poll: a server that stays down
+                // would otherwise fill the log.
+                if entry.state.lock().await.consecutive_failures == 0 {
+                    crate::applog::warn("MONITOR", format!("poll failed for node {node_id}: {e}"));
+                }
                 handle = None;
                 record_failure(&app, &entry, &node_name, threshold, &e, notify, beep).await;
                 mark_disconnected(&app, &entry, Some(e)).await;
@@ -619,9 +623,12 @@ impl client::Handler for MonitorHandler {
         // Host certificates are refused (no CA trust store) — same policy as
         // the interactive ClientHandler; see ssh_manager::plain_host_key.
         let Some(server_public_key) = crate::ssh_manager::plain_host_key(offered) else {
-            eprintln!(
-                "[monitor] {}:{} presented a host certificate; certificates can't be verified (no trusted CA), refusing",
-                self.host, self.port
+            crate::applog::warn(
+                "MONITOR",
+                format!(
+                    "{}:{} presented a host certificate; certificates can't be verified (no trusted CA), refusing",
+                    self.host, self.port
+                ),
             );
             return Ok(false);
         };

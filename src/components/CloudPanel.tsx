@@ -5,6 +5,7 @@ import {
   LogOut, Mail, KeyRound, UserPlus, LogIn, Wand2,
 } from "lucide-react";
 import InvitesSection from "./InvitesSection";
+import SyncStorageSection from "./SyncStorageSection";
 import SyncServerSetting, { CloudConfigView, hostOf } from "./SyncServerSetting";
 
 // Cloud account panel, opened from the profile picker. Owns its own auth state;
@@ -315,6 +316,10 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
               <button aria-label="Dismiss" onClick={() => setInfo(null)} className="text-emerald-200/70 hover:text-white"><X size={12} /></button>
             </div>
           )}
+
+          {/* Where personal profiles sync — here on the picker so a fresh device
+              can point at its bucket BEFORE restoring a profile from it. */}
+          <SyncStorageSection />
 
           {/* ----- Chooser ----- */}
           {stage === "chooser" && (

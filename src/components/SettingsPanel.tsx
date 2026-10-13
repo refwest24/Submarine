@@ -10,6 +10,7 @@ import {
 } from "../util/shellSync";
 import { invoke } from "@tauri-apps/api/core";
 import CopyValue from "./CopyValue";
+import SyncStorageSection from "./SyncStorageSection";
 import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
 
@@ -322,6 +323,10 @@ function ShellConfigSyncSettings({ servers }: { servers: any[] }) {
 }
 
 const SettingsPanel = ({ settings, setSettings, onOpenLogs, servers = [] }: any) => {
+  const [logPath, setLogPath] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<string | null>("app_log_path").then(setLogPath).catch(() => {});
+  }, []);
   const accentColors = [
     { name: 'Light Blue', value: '#60a5fa' },
     { name: 'Sky', value: '#38bdf8' },
@@ -470,6 +475,13 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, servers = [] }: any)
               >
                 <List size={14} /> View Activity Log
               </button>
+              {logPath && (
+                <p className="text-[11.5px] text-zinc-500 leading-relaxed">
+                  This log, plus sync, storage and connection errors, is also saved to{" "}
+                  <span className="font-mono text-zinc-400 break-all select-text">{logPath}</span>
+                  {" "}— passwords and keys are kept out of it.
+                </p>
+              )}
             </div>
           </section>
         )}
@@ -508,6 +520,10 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, servers = [] }: any)
                 on the Profile tab, next to Sync now.
               </div>
             )}
+
+            <div className="border-t border-white/5 pt-4">
+              <SyncStorageSection />
+            </div>
           </div>
         </section>
 

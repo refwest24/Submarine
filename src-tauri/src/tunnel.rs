@@ -762,9 +762,12 @@ fn drained_stream_with_cap(channel: russh::Channel<russh::client::Msg>, cap: usi
                         if queued.fetch_add(n, Ordering::AcqRel) + n > cap {
                             overflowed.store(true, Ordering::Release);
                             overflow.notify_one();
-                            eprintln!(
-                                "[tunnel] local peer stopped reading ({} KiB backlog) — closing this forwarded connection",
-                                cap >> 10
+                            crate::applog::warn(
+                                "TUNNEL",
+                                format!(
+                                    "local peer stopped reading ({} KiB backlog) — closing this forwarded connection",
+                                    cap >> 10
+                                ),
                             );
                             break;
                         }
@@ -1236,14 +1239,17 @@ pub async fn bridge_forwarded_channel(
             pump_channel(&mut local, &mut stream).await;
         }
         Ok(Err(e)) => {
-            eprintln!("[remote-forward] connect to {} failed: {}", entry.target, e);
+            crate::applog::warn("TUNNEL", format!("remote-forward connect to {} failed: {}", entry.target, e));
             drop(channel);
             reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
         }
         Err(_) => {
-            eprintln!(
-                "[remote-forward] connect to {} timed out after {:?}",
-                entry.target, FORWARDED_CONNECT_TIMEOUT
+            crate::applog::warn(
+                "TUNNEL",
+                format!(
+                    "remote-forward connect to {} timed out after {:?}",
+                    entry.target, FORWARDED_CONNECT_TIMEOUT
+                ),
             );
             drop(channel);
             reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;

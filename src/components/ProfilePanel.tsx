@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Cloud, CloudOff, RefreshCw, Share2, UserPlus, X, Loader2, Users,
-  AlertTriangle, CheckCircle2, ShieldOff, Pencil, Eye, History, HardDrive,
+  AlertTriangle, CheckCircle2, ShieldOff, Pencil, Eye, History, HardDrive, Database,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { RoleBadge, roleBlurb } from "./shareRoles";
@@ -51,6 +51,10 @@ interface ShareStatus {
   identity_unlocked: boolean;
   signed_in: boolean;
   email: string | null;
+  // Transport for personal (unshared) profiles on this device, and whether it
+  // can run: signed in for "http", a bucket set for "s3".
+  backend: "http" | "s3";
+  personal_sync_ready: boolean;
   /** The server this profile syncs with; null until its first sync. */
   cloud_server: string | null;
   /** The sync server in use. */
@@ -62,7 +66,8 @@ interface ShareStatus {
 interface MemberInfo { user_id: number; email: string; role: string; status: string; }
 
 type Props = {
-  onSync: () => Promise<void> | void;
+  /** Resolves to the error text when the sync failed (already in the Activity Log), else null. */
+  onSync: () => Promise<string | null>;
   syncing: boolean;
   lastSyncLabel: string | null;
   autoSync: boolean;
@@ -90,7 +95,7 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
   const [stuck, setStuck] = useState(false);
   const prevPull = useRef<number | null>(null);
 
-  const clean = (e: unknown) => String(e).replace(/^\[[A-Z_]+\]\s*/, "");
+  const clean = (e: unknown) => String(e).replace(/^\[[A-Z0-9_]+\]\s*/, "");
   const flash = (m: string) => { setOk(m); setErr(null); setTimeout(() => setOk(null), 4000); };
   const fail = (e: unknown) => { setErr(clean(e)); setOk(null); };
 
@@ -240,7 +245,9 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
   };
 
   const doSync = async () => {
-    await onSync();
+    setErr(null);
+    const failed = await onSync();
+    if (failed) setErr(failed);
     refresh();
     loadStats();
   };
@@ -248,9 +255,16 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
   const shared = !!st?.share_id;
   const isOwner = st?.role === "owner";
   const signedIn = st?.signed_in === true;
+  // Shared profiles always sync through the cloud account; personal ones go
+  // wherever this device is set to sync.
+  const viaS3 = !shared && st?.backend === "s3";
+  const syncReady = shared ? signedIn : st?.personal_sync_ready === true;
+  const where = viaS3 ? "your bucket" : "the cloud";
   // A profile linked to another server than the one in use doesn't sync: its
-  // data and keys only ever go to the server it syncs with.
-  const otherServer = st?.cloud_server && st.cloud_server !== st.current_server ? st.cloud_server : null;
+  // data and keys only ever go to the server it syncs with. A personal profile
+  // that syncs through a bucket isn't tied to any server.
+  const otherServer =
+    !viaS3 && st?.cloud_server && st.cloud_server !== st.current_server ? st.cloud_server : null;
 
   const moveHere = async () => {
     if (!st || !otherServer) return;
@@ -309,7 +323,21 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
       <section className={card}>
         <div className={label}>Cloud</div>
         <div className="flex items-center gap-2 flex-wrap">
-          {signedIn ? (
+          {viaS3 ? (
+            syncReady ? (
+              <>
+                <Database size={14} className="text-primary shrink-0" />
+                <span className="text-[12.5px] text-zinc-200">Syncing through your S3 bucket.</span>
+              </>
+            ) : (
+              <>
+                <CloudOff size={14} className="text-zinc-500 shrink-0" />
+                <span className="text-[12.5px] text-zinc-400">
+                  S3 sync isn't set up yet — lock this profile and open the Cloud button on the picker.
+                </span>
+              </>
+            )
+          ) : signedIn ? (
             <>
               <Cloud size={14} className="text-primary shrink-0" />
               <span className="text-[12.5px] text-zinc-200 font-mono truncate">{st?.email}</span>
@@ -323,7 +351,7 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
             </>
           )}
         </div>
-        {st?.custom_server && !otherServer && (
+        {!viaS3 && st?.custom_server && !otherServer && (
           <div className="text-[11px] text-zinc-500">
             Sync server: <span className="font-mono text-zinc-400">{hostOf(st.current_server)}</span>
           </div>
@@ -351,7 +379,7 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
             )}
           </div>
         )}
-        {signedIn && (
+        {syncReady && (
           <>
             <div className="flex items-center gap-2 flex-wrap">
               <button
@@ -369,7 +397,7 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
                 <>
                   <span className="flex items-center gap-1.5 text-emerald-300/90">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                    Auto-sync is on — your changes are saved to the cloud automatically.
+                    Auto-sync is on — your changes are saved to {where} automatically.
                   </span>
                   <button onClick={onToggleAutoSync} className="text-zinc-400 hover:text-zinc-200 underline underline-offset-2 shrink-0">Turn off</button>
                 </>
@@ -412,7 +440,7 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
               if (pending === 0) {
                 return (
                   <div className="flex items-center gap-1.5 text-[11.5px] text-emerald-300/90">
-                    <CheckCircle2 size={12} /> Everything is in sync with the cloud.
+                    <CheckCircle2 size={12} /> Everything is in sync with {where}.
                   </div>
                 );
               }

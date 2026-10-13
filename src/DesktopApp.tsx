@@ -363,6 +363,8 @@ function DesktopApp() {
     // re-keys every row on every push and busts list reconciliation.
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setLogs(prev => [...prev.slice(-99), { id, msg, type, time: new Date().toLocaleTimeString() }]);
+    // Also to the log file (redacted there), which outlives the session.
+    invoke("app_log", { level: type, area: "ACTIVITY", message: msg }).catch(() => {});
   }, []);
 
   // Wrapped in useCallback because these are handed to memoised children
@@ -407,22 +409,34 @@ function DesktopApp() {
   // changed record and merges back the server's view (Last-Write-Wins by HLC),
   // without the server ever decrypting anything. A guard prevents overlapping
   // runs; on success we reload all local lists so a pulled change shows at once.
-  const handleCloudSync = useCallback(async () => {
+  // Returns the error it logged (null on success) so the Profile panel can show it too.
+  const handleCloudSync = useCallback(async (): Promise<string | null> => {
     setCloudSyncing(true);
     try {
       const report = await invoke<{ pushed: number; pulled: number }>("sync_now");
       await refreshAll();
       setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
       addLog(`Cloud sync complete — pushed ${report.pushed}, pulled ${report.pulled}.`, "success");
+      return null;
     } catch (e) {
       const msg = String(e);
-      if (/NO_TOKEN|invalid_token|Missing auth|401/i.test(msg)) {
-        addLog("Cloud sync: not signed in. Open the Cloud panel from the profile picker and sign in first.", "error");
+      let text: string;
+      if (/NOT_SIGNED_IN|NO_TOKEN|invalid_token|Missing auth|401/i.test(msg)) {
+        text = "Cloud sync: not signed in. Open the Cloud panel from the profile picker and sign in first.";
       } else if (/NO_PROFILE_OPEN|DB_NOT_OPEN|NO_KEY|NO_HLC/i.test(msg)) {
-        addLog("Cloud sync: no profile open — unlock a profile first.", "error");
+        text = "Cloud sync: no profile open — unlock a profile first.";
+      } else if (/^\[SYNC\] (OTHER_SERVER|SHARED_PROFILE|SHARE_CHANGED):/.test(msg)) {
+        // Already a sentence for the user; only the code goes.
+        text = `Cloud sync: ${msg.replace(/^\[SYNC\] [A-Z_]+:\s*/, "")}`;
+      } else if (/^\[S3\] (NOT_CONFIGURED|CREDENTIALS_FILE|CONFIG_INVALID)/.test(msg)) {
+        text = `Sync storage isn't set up: ${msg.replace(/^\[S3\] [A-Z_]+:\s*/, "")} — fix it in Settings → Cloud Sync.`;
+      } else if (msg.startsWith("[S3]")) {
+        text = `Sync to your bucket failed: ${msg.replace(/^\[S3\] [A-Z_]+:\s*/, "")}`;
       } else {
-        addLog(`Cloud sync failed: ${msg}`, "error");
+        text = `Cloud sync failed: ${msg}`;
       }
+      addLog(text, "error");
+      return text;
     } finally {
       setCloudSyncing(false);
     }

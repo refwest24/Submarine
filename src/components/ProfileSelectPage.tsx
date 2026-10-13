@@ -2,7 +2,7 @@ import { Fragment, forwardRef, useCallback, useEffect, useLayoutEffect, useRef, 
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  AlertTriangle, ArrowBigUp, ArrowRight, ArrowUpCircle, Check, CheckCircle2, Cloud, CloudOff, Download,
+  AlertTriangle, ArrowBigUp, ArrowRight, ArrowUpCircle, Check, CheckCircle2, Cloud, CloudOff, Database, Download,
   Eye, EyeOff, Github, HardDrive, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2, Upload, X,
 } from "lucide-react";
 import CloudPanel from "./CloudPanel";
@@ -28,6 +28,9 @@ const bytesToBase64 = (bytes: Uint8Array) => {
 };
 
 interface CloudStatus { signed_in: boolean; email: string | null; }
+// Where personal profiles sync on this device (backend: sync_backend_get).
+// Only the non-secret fields the picker shows.
+interface SyncStorage { backend: "http" | "s3"; s3: { bucket: string; prefix: string }; credentials_ok: boolean; }
 // One personal profile as reported by the cloud (GET /sync/profiles). Names +
 // counts only — the server never sees the encrypted contents. `profile` is the
 // partition key (a name for legacy profiles, a UUID for new ones); `name` is the
@@ -46,8 +49,14 @@ const REPO_URL = "https://github.com/SinaXhpm/Submarine";
 // on-disk vault exists here; `cloud` = the matching cloud partition (or null).
 // Merging local + cloud into a single row is what lets the login screen be the
 // one place to SEE and MANAGE every profile — open it, export it, remove it
-// here, get it from the cloud, or delete it from the cloud.
-interface Row { name: string; local: boolean; cloud: CloudProfile | null; }
+// here, get it from the cloud, or delete it from the cloud. `key` identifies the
+// row: names alone can't, since a local profile and cloud profiles may share one.
+interface Row { key: string; name: string; local: boolean; cloud: CloudProfile | null; }
+const localKey = (name: string) => `local:${name}`;
+
+// The picker has no Activity Log: problems it hides or shows go to the log file.
+const logFile = (level: "warn" | "error", message: string) =>
+  invoke("app_log", { level, area: "PICKER", message }).catch(() => {});
 
 // What the page is busy with. One action at a time.
 type Pending = "unlock" | "create" | "import" | "get" | "work";
@@ -68,11 +77,13 @@ const forgetLastProfile = (name: string) => {
 };
 
 // Clean the [PREFIX] off backend errors for display.
-const cleanErr = (e: unknown) => String(e).replace(/^\[[A-Z_]+\]\s*/, "");
+const cleanErr = (e: unknown) => String(e).replace(/^\[[A-Z0-9_]+\]\s*/, "");
 
 // The backend's rules for a profile name (lib.rs validate_profile_name),
-// checked while it's typed, plus the names already taken. Case doesn't count:
-// the list matches names that way, and so do Windows file names.
+// checked while it's typed, plus the names already taken. A name is refused
+// when it matches a profile here or in the cloud in any letter case, so two
+// profiles never differ only by case (the backend's ensure_profile_name_free
+// refuses the same). The list itself links names exactly.
 const RESERVED_NAME = /^(CON|PRN|AUX|NUL|COM\d|LPT\d)$/i;
 const nameProblem = (name: string, local: string[], cloud: string[]): string | null => {
   if (!name) return null;
@@ -153,7 +164,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const [pending, setPending] = useState<Pending | null>(null);
   const busy = pending !== null;
 
-  // The open row (by display name). A local row opens to its password box; a
+  // The open row (by row key). A local row opens to its password box; a
   // cloud-only row to Get.
   const [selected, setSelected] = useState<string>("");
   const [password, setPassword] = useState("");
@@ -185,15 +196,19 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ signed_in: false, email: null });
   // The sync server's host, shown beside the account when it isn't the default.
   const [cloudHost, setCloudHost] = useState<string | null>(null);
+  const [storage, setStorage] = useState<SyncStorage | null>(null);
+  // Personal profiles can be listed/restored: signed in, or an S3 bucket set
+  // up. Broken S3 keys don't hide the list; listing it says what's wrong.
+  const listReady = storage?.backend === "s3" ? !!storage.s3.bucket : cloudStatus.signed_in;
   // Profiles that live in the signed-in cloud account. Merged with the local
   // list below so a fresh device SHOWS the user's profiles instead of making
   // them remember and type a name. Empty until signed in (or on network error).
   const [cloudProfiles, setCloudProfiles] = useState<CloudProfile[]>([]);
   // A click on refresh, while it runs.
   const [refreshing, setRefreshing] = useState(false);
-  // The row whose actions menu is open, where to put it, and what to focus
-  // when it closes.
-  const [menu, setMenu] = useState<{ name: string; place: MenuPlace; from: HTMLElement | null } | null>(null);
+  // The row whose actions menu is open (by row key), where to put it, and what
+  // to focus when it closes.
+  const [menu, setMenu] = useState<{ key: string; place: MenuPlace; from: HTMLElement | null } | null>(null);
   // A newer published release than the running build, if any. Set only when
   // one actually exists, so the notice under the footer appears solely when
   // there's something to announce.
@@ -217,10 +232,12 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const importNameRef = useRef<HTMLInputElement | null>(null);
 
   // The row to open when none is: the profile opened last here, else the first.
+  // Takes and returns a row key; the profile opened last is kept by name.
   const pickFrom = (list: string[], prev: string) => {
-    if (prev && list.includes(prev)) return prev;
+    if (prev && list.some((p) => localKey(p) === prev)) return prev;
     const last = lastProfile();
-    return list.includes(last) ? last : list[0] || "";
+    if (list.includes(last)) return localKey(last);
+    return list[0] ? localKey(list[0]) : "";
   };
 
   const reload = async () => {
@@ -237,24 +254,36 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   };
   useEffect(() => { reload(); /* eslint-disable-next-line */ }, []);
 
-  // Cloud connection + the account's profile list. Best-effort: a network
-  // failure must never block unlocking a local profile, so errors just leave
-  // the cloud side empty. A click on refresh (`manual`) says what went wrong.
+  // Cloud connection, where personal profiles sync (the account's server or
+  // an S3 bucket) + their profile list. Best-effort: a network failure must
+  // never block unlocking a local profile, so errors just leave the cloud side
+  // empty and go to the log file. A click on refresh (`manual`) also says
+  // what went wrong.
   const refreshCloud = useCallback(async (manual = false) => {
     if (manual) setRefreshing(true);
     try {
       const s = await invoke<CloudStatus>("cloud_status");
       setCloudStatus(s);
-      if (s.signed_in) {
+      const b = await invoke<SyncStorage>("sync_backend_get").catch((e) => {
+        logFile("warn", `sync storage settings unreadable: ${e}`);
+        return null;
+      });
+      setStorage(b);
+      const s3 = b?.backend === "s3";
+      // The server's host is shown only beside a signed-in account.
+      if (s.signed_in && !s3) {
         invoke<CloudConfigView>("cloud_get_config")
           .then((v) => setCloudHost(v.is_custom ? hostOf(v.server) : null))
           .catch(() => setCloudHost(null));
+      }
+      if (s3 ? !!b.s3.bucket : s.signed_in) {
         try {
           const cps = await invoke<CloudProfile[]>("cloud_list_sync_profiles");
           // Hide empty / retired partitions (all-tombstone or escrow-only) —
           // they'd just be noise in the picker.
           setCloudProfiles(cps.filter((c) => c.live_records > 0));
         } catch (e) {
+          logFile("warn", `listing cloud profiles failed: ${e}`);
           setCloudProfiles([]);
           if (manual) setError(`Couldn't load your cloud profiles: ${cleanErr(e)}`);
         }
@@ -263,6 +292,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       }
     } catch (e) {
       // The panel can still be opened to retry.
+      logFile("warn", `cloud status check failed: ${e}`);
       if (manual) setError(`Couldn't reach the cloud: ${cleanErr(e)}`);
     } finally {
       if (manual) setRefreshing(false);
@@ -329,24 +359,32 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     requestAnimationFrame(() => passwordInputRef.current?.focus());
   }, [selected]);
 
-  // Merge local + cloud into one ordered list, matched case-insensitively by
-  // display name (a local file and its cloud partition are the SAME profile
-  // even though the partition key may be an opaque UUID). Local-first, then
-  // alphabetical, so the profiles already on this device sit up top.
+  // Merge local + cloud into one ordered list. A local file and its cloud
+  // partition are the SAME profile when their names match EXACTLY — names are
+  // case-sensitive, so `e2e` and `E2e` are two profiles. The name is the only
+  // link (a local vault's partition id is sealed until unlock), so when several
+  // cloud profiles share a name none is linked to the local copy: "Delete from
+  // cloud" must never reach the wrong one. Each unlinked cloud profile gets its
+  // own row. Local-first, then alphabetical, so the profiles already on this
+  // device sit up top.
   const buildRows = (): Row[] => {
-    const byKey = new Map<string, Row>();
-    for (const p of profiles) byKey.set(p.toLowerCase(), { name: p, local: true, cloud: null });
-    for (const c of cloudProfiles) {
-      const k = c.name.toLowerCase();
-      const existing = byKey.get(k);
-      if (existing) existing.cloud = c;
-      else byKey.set(k, { name: c.name, local: false, cloud: c });
+    const cloudByName = new Map<string, CloudProfile[]>();
+    for (const c of cloudProfiles) cloudByName.set(c.name, [...(cloudByName.get(c.name) ?? []), c]);
+    const rows: Row[] = profiles.map((p) => {
+      const matches = cloudByName.get(p) ?? [];
+      const cloud = matches.length === 1 ? matches[0] : null;
+      if (cloud) cloudByName.delete(p);
+      return { key: localKey(p), name: p, local: true, cloud };
+    });
+    for (const list of cloudByName.values()) {
+      for (const c of list) rows.push({ key: `cloud:${c.profile}`, name: c.name, local: false, cloud: c });
     }
-    return Array.from(byKey.values()).sort((a, b) =>
-      a.local !== b.local ? (a.local ? -1 : 1) : a.name.localeCompare(b.name)
+    return rows.sort((a, b) =>
+      a.local !== b.local ? (a.local ? -1 : 1) : a.name.localeCompare(b.name) || a.key.localeCompare(b.key)
     );
   };
   const rows = buildRows();
+  const selectedRow = rows.find((r) => r.key === selected);
 
   // First run (nothing anywhere) drops straight into create; a returning user
   // on a fresh device (cloud profiles, no local) still sees the list so they
@@ -362,8 +400,8 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
 
   // A click on the open row puts the cursor back in its password box.
   const pick = (row: Row) => {
-    if (row.name === selected) passwordInputRef.current?.focus();
-    else setSelected(row.name);
+    if (row.key === selected) passwordInputRef.current?.focus();
+    else setSelected(row.key);
   };
 
   const openCreate = () => {
@@ -379,15 +417,18 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   };
 
   const unlockSelected = async () => {
-    const name = selected;
-    if (!name || !password || busy) return;
+    if (!selectedRow?.local || !password || busy) return;
+    const name = selectedRow.name;
     setPending("unlock"); setUnlockError(null);
     try {
       await invoke("select_profile", { name });
       await invoke("setup_master_db", { password });
     } catch (e) {
       const raw = String(e);
-      setUnlockError(raw.toLowerCase().includes("decrypt") ? "Wrong password." : cleanErr(e));
+      const wrong = raw.toLowerCase().includes("decrypt");
+      // Never the password itself.
+      logFile("warn", `opening '${name}' failed: ${wrong ? "wrong password" : raw}`);
+      setUnlockError(wrong ? "Wrong password." : cleanErr(e));
       setPending(null);
       shake(unlockFieldRef.current);
       // Selected, so the next try types over it.
@@ -505,9 +546,15 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     }
   };
 
-  // An imported file is a profile of its own, so only names on this device
-  // are taken; the cloud one of the same name may well be this very profile.
-  const importIssue = importStaged ? nameProblem(importStaged.name.trim(), profiles, []) : null;
+  // A cloud profile of exactly the same name may well be this very file, so
+  // only cloud names that differ from it in letter case alone are taken.
+  const importIssue = importStaged
+    ? nameProblem(
+        importStaged.name.trim(),
+        profiles,
+        cloudProfiles.map((c) => c.name).filter((n) => n !== importStaged.name.trim()),
+      )
+    : null;
 
   const cancelImport = () => { setImportStaged(null); setError(null); };
 
@@ -526,7 +573,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       closeCreate();
       setInfo(`Imported as "${name}". Open it with its original password.`);
       await reload();
-      setSelected(name);
+      setSelected(localKey(name));
     } catch (e) {
       setError(cleanErr(e));
     } finally {
@@ -539,7 +586,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // — the confirm wording says which.
   const removeLocal = async (name: string) => {
     if (busy) return;
-    const inCloud = cloudProfiles.some((c) => c.name.toLowerCase() === name.toLowerCase());
+    const inCloud = cloudProfiles.some((c) => c.name === name);
     const ok = await confirm({
       title: "Remove from this device",
       message: inCloud
@@ -579,7 +626,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       const n = await invoke<number>("cloud_delete_profile", { profile: row.cloud.profile });
       setInfo(`Removed "${row.name}" from the cloud (${n} record${n === 1 ? "" : "s"}).`);
       // A cloud-only row is gone with it: open a local one instead.
-      if (!row.local) setSelected((prev) => (prev === row.name ? pickFrom(profiles, "") : prev));
+      if (!row.local) setSelected((prev) => (prev === row.key ? pickFrom(profiles, "") : prev));
       await refreshCloud();
     } catch (e) {
       setError(cleanErr(e));
@@ -612,7 +659,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       });
       setInfo(`"${c.name}" is now on this device — pulled ${rep.pulled} item${rep.pulled === 1 ? "" : "s"}. Open it below with the same password.`);
       await reload();
-      setSelected(c.name);
+      setSelected(localKey(c.name));
       refreshCloud();
     } catch (e) {
       setError(cleanErr(e));
@@ -634,7 +681,8 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     if (row.cloud) items.push({ label: "Delete from cloud…", icon: <CloudOff size={14} />, danger: true, onSelect: () => deleteFromCloud(row) });
     return items;
   };
-  const menuRow = menu ? rows.find((r) => r.name === menu.name) : undefined;
+  // By key: a local row and cloud rows can share a name.
+  const menuRow = menu ? rows.find((r) => r.key === menu.key) : undefined;
 
   const closeMenu = (refocus: boolean) => {
     const from = menu?.from;
@@ -834,7 +882,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
           <section aria-label="Your profiles">
             <div className="mb-2 flex h-7 items-center justify-between pl-1">
               <h2 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Your profiles</h2>
-              {cloudStatus.signed_in && (
+              {listReady && (
                 <button
                   type="button"
                   onClick={() => refreshCloud(true)}
@@ -850,10 +898,10 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
 
             <ul className="space-y-2">
               {rows.map((row) => {
-                const open = selected === row.name;
+                const open = selected === row.key;
                 return (
                   <li
-                    key={row.name}
+                    key={row.key}
                     className={`rounded-2xl border transition-colors ${
                       open
                         ? "border-white/[0.1] bg-white/[0.04] shadow-[0_16px_48px_-24px_rgba(0,0,0,0.9)]"
@@ -867,7 +915,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                         e.preventDefault();
                         if (busy) return;
                         setMenu({
-                          name: row.name,
+                          key: row.key,
                           place: { x: e.clientX, top: e.clientY, bottom: e.clientY, end: false },
                           from: e.currentTarget.querySelector("button"),
                         });
@@ -890,11 +938,11 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                         type="button"
                         onClick={(e) => {
                           const r = e.currentTarget.getBoundingClientRect();
-                          setMenu({ name: row.name, place: { x: r.right, top: r.top, bottom: r.bottom, end: true }, from: e.currentTarget });
+                          setMenu({ key: row.key, place: { x: r.right, top: r.top, bottom: r.bottom, end: true }, from: e.currentTarget });
                         }}
                         disabled={busy}
                         aria-haspopup="menu"
-                        aria-expanded={menu?.name === row.name}
+                        aria-expanded={menu?.key === row.key}
                         aria-label={`Actions for ${row.name}`}
                         title="More actions"
                         className="mr-2 grid h-9 w-9 shrink-0 place-items-center rounded-lg text-zinc-500 outline-none transition-colors hover:bg-white/[0.07] hover:text-zinc-100 focus-visible:ring-2 focus-visible:ring-primary/50 disabled:opacity-40"
@@ -979,8 +1027,16 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         )}
 
         {/* Cloud status — always visible. Signed-out shows a Connect link;
-            signed-in shows the account and a way into Manage. */}
-        <CloudBar status={cloudStatus} host={cloudHost} busy={busy} firstRun={firstRun} onManage={() => setCloudOpen(true)} />
+            signed-in shows the account and a way into Manage; S3 storage
+            shows the bucket. */}
+        <CloudBar
+          status={cloudStatus}
+          storage={storage}
+          host={cloudHost}
+          busy={busy}
+          firstRun={firstRun}
+          onManage={() => setCloudOpen(true)}
+        />
 
         {/* GitHub, the update check and the running version side by side,
             with a live "new version" notice underneath when one is available
@@ -1345,14 +1401,48 @@ const FooterButton = ({
 const FooterDot = () => <span aria-hidden className="text-zinc-700 select-none">·</span>;
 
 const CloudBar = ({
-  status, host, busy, firstRun, onManage,
+  status, storage, host, busy, firstRun, onManage,
 }: {
   status: CloudStatus;
+  storage: SyncStorage | null;
   host: string | null;
   busy: boolean;
   firstRun: boolean;
   onManage: () => void;
 }) => {
+  // Syncing through the user's own bucket: show where, and whether it's
+  // usable. Manage opens the same panel, where the storage is set up.
+  if (storage?.backend === "s3") {
+    const ready = storage.credentials_ok && !!storage.s3.bucket;
+    return (
+      <div className={`${CARD} mt-4 flex items-center gap-3 py-2 pl-2.5 pr-1.5`}>
+        <span className="relative grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary">
+          <Database size={15} />
+          <span
+            aria-hidden
+            className={`absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-background ${ready ? "bg-emerald-400" : "bg-amber-400"}`}
+          />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate font-mono text-[12.5px] text-zinc-200">
+            {storage.s3.bucket || "—"}{storage.s3.prefix ? `/${storage.s3.prefix}` : ""}
+          </span>
+          <span className={`block truncate text-[11px] ${ready ? "text-zinc-500" : "text-amber-300/90"}`}>
+            {ready ? "S3 bucket" : "S3 bucket · Needs setup"}
+          </span>
+        </span>
+        <button
+          type="button"
+          onClick={onManage}
+          disabled={busy}
+          title="Manage sync storage"
+          className="h-8 shrink-0 rounded-lg px-3 text-[12px] font-medium text-zinc-300 transition-colors hover:bg-white/[0.07] hover:text-white disabled:opacity-40"
+        >
+          Manage
+        </button>
+      </div>
+    );
+  }
   // Signed-out: a light link rather than another full-width button — the
   // user hasn't asked for cloud yet, so it shouldn't compete with the
   // profiles. On a first run it's how a returning user finds theirs.

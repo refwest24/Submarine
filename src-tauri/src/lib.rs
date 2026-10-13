@@ -23,6 +23,11 @@ mod mirror;
 mod docker;
 mod hlc;
 mod identity;
+mod object_sync;
+mod s3_store;
+mod sigv4;
+mod sync_backend;
+mod applog;
 mod portable;
 mod fonts;
 mod webkit_sandbox;
@@ -120,6 +125,39 @@ pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
         return Err(format!("'{}' is a reserved name on Windows", n));
     }
     Ok(())
+}
+
+/// Refuse a new profile name that matches a profile in `dir` in any letter
+/// case, on every platform (user decision 2026-10-12). A profile is the file
+/// `<name>.submarine`: where the disk ignores case (macOS and Windows by
+/// default) `e2e` and `E2e` would be one file, and where it doesn't (Linux)
+/// they would be two profiles that are easy to mix up. Names are still kept and
+/// matched exactly as typed; the picker applies the same rule to cloud profiles.
+pub(crate) fn ensure_profile_name_free(dir: &std::path::Path, name: &str) -> Result<(), String> {
+    let (mut exact, mut variant) = (false, None);
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("submarine") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if stem == name {
+            exact = true;
+            break;
+        }
+        if stem.eq_ignore_ascii_case(name) {
+            variant = Some(stem.to_string());
+        }
+    }
+    let message = match (exact, variant) {
+        (true, _) => format!("Profile '{name}' already exists"),
+        (false, Some(other)) => format!(
+            "Can't use '{name}': you already have a profile called '{other}', and names that differ only in letter case aren't allowed. Pick another name."
+        ),
+        (false, None) => return Ok(()),
+    };
+    applog::warn("PROFILE", &message);
+    Err(message)
 }
 
 // Argon2id parameters for vault-key derivation:
@@ -590,6 +628,13 @@ fn create_sync_triggers(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("[SYNC] SYNC_META_TABLE: {e}"))?;
+    // Device-local: optional FK links whose referent hadn't arrived when the
+    // referrer was merged. See `retry_pending_fks`.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_fk_pending (tbl TEXT NOT NULL, uuid TEXT NOT NULL, fk_col TEXT NOT NULL, ref_table TEXT NOT NULL, ref_uuid TEXT NOT NULL, referrer_ua TEXT NOT NULL, PRIMARY KEY (tbl, uuid, fk_col))",
+        [],
+    )
+    .map_err(|e| format!("[SYNC] FK_PENDING_TABLE: {e}"))?;
     // Guard shared by the stamp/tombstone triggers: suppress them while merging.
     const GUARD: &str = "COALESCE((SELECT val FROM sync_flags WHERE key='merge'),0)=0";
     // The editor label stamped onto edited_by at mutation time (email when known,
@@ -922,14 +967,14 @@ fn apply_remote_inner(conn: &Connection, key: &[u8; 32], records: &[SyncRecord],
         for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
             if let Err(e) = apply_entity(&tx, key, spec, rec, &mut fk_fixups) {
                 skipped += 1;
-                eprintln!("[SYNC] skipped record uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
+                applog::warn("SYNC", format!("skipped record uuid={} type={}: {}", rec.uuid, rec.entity_type, e));
             }
         }
     }
     for rec in records.iter().filter(|r| r.deleted) {
         if let Err(e) = apply_tombstone(&tx, rec) {
             skipped += 1;
-            eprintln!("[SYNC] skipped tombstone uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
+            applog::warn("SYNC", format!("skipped tombstone uuid={} type={}: {}", rec.uuid, rec.entity_type, e));
         }
     }
     // Re-resolve every optional FK against the FINAL state of the batch, now that
@@ -946,14 +991,110 @@ fn apply_remote_inner(conn: &Connection, key: &[u8; 32], records: &[SyncRecord],
             &format!("UPDATE {} SET {}=?1 WHERE uuid=?2", f.table, f.fk_col),
             rusqlite::params![id, f.uuid],
         ) {
-            eprintln!("[SYNC] fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
+            applog::warn("SYNC", format!("fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e));
+            continue;
+        }
+        if let Err(e) = note_pending_fk(&tx, &f, id.is_some()) {
+            applog::warn("SYNC", format!("fk pending skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e));
         }
     }
+    retry_pending_fks(&tx);
     tx.commit().map_err(|e| format!("[SYNC] TX_COMMIT: {e}"))?;
     if skipped > 0 {
-        eprintln!("[SYNC] merge committed with {skipped} record(s) skipped");
+        applog::warn("SYNC", format!("merge committed with {skipped} record(s) skipped"));
     }
     Ok(())
+}
+
+/// Remember (or forget) an optional FK link left unresolved at the end of a
+/// batch. The HTTP server answers with one consistent snapshot, but an object
+/// store lists keys page by page, so a server can arrive one sync before the
+/// credential it points at. Without a memory of the intended link, the fixup
+/// writes NULL, the next sync skips the (equal-stamped) server, and the link is
+/// lost for good. A referent that is already tombstoned is never coming, so the
+/// NULL stands — exactly as before.
+fn note_pending_fk(conn: &Connection, f: &FkFixup, resolved: bool) -> Result<(), String> {
+    let gone: bool = conn
+        .query_row("SELECT 1 FROM sync_tombstones WHERE uuid=?1", [&f.ref_uuid], |_| Ok(()))
+        .is_ok();
+    let referrer_ua: Option<String> = conn
+        .query_row(&format!("SELECT updated_at FROM {} WHERE uuid=?1", f.table), [&f.uuid], |r| r.get(0))
+        .ok()
+        .flatten();
+    match referrer_ua {
+        Some(ua) if !resolved && !gone => conn.execute(
+            "INSERT INTO sync_fk_pending(tbl,uuid,fk_col,ref_table,ref_uuid,referrer_ua) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(tbl,uuid,fk_col) DO UPDATE SET ref_table=excluded.ref_table, ref_uuid=excluded.ref_uuid, referrer_ua=excluded.referrer_ua",
+            rusqlite::params![f.table, f.uuid, f.fk_col, f.ref_table, f.ref_uuid, ua],
+        ),
+        _ => conn.execute(
+            "DELETE FROM sync_fk_pending WHERE tbl=?1 AND uuid=?2 AND fk_col=?3",
+            rusqlite::params![f.table, f.uuid, f.fk_col],
+        ),
+    }
+    .map(|_| ())
+    .map_err(|e| format!("[SYNC] FK_PENDING: {e}"))
+}
+
+/// Repair remembered links whose referent has since arrived. A pending link is
+/// dropped once it resolves, once its referrer is gone or re-stamped (a newer
+/// edit — local or remote — now owns that column), or once the referent is
+/// tombstoned. Best-effort, like the rest of the merge: a bad row is dropped,
+/// never fatal. Runs with the merge guard on, so the repair keeps the
+/// referrer's stamp.
+fn retry_pending_fks(conn: &Connection) {
+    let pending: Vec<(String, String, String, String, String, String)> = match conn
+        .prepare("SELECT tbl, uuid, fk_col, ref_table, ref_uuid, referrer_ua FROM sync_fk_pending")
+        .and_then(|mut stmt| {
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+                .collect::<Result<Vec<_>, _>>();
+            rows
+        }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            applog::warn("SYNC", format!("fk pending read failed: {e}"));
+            return;
+        }
+    };
+    for (tbl, uuid, fk_col, ref_table, ref_uuid, referrer_ua) in pending {
+        // Table/column names are interpolated below, so only accept a triple
+        // that names a real optional FK.
+        let known = ENTITIES.iter().any(|s| {
+            s.table == tbl && s.fks.iter().any(|fk| !fk.required && fk.col == fk_col && fk.ref_table == ref_table)
+        });
+        let keep = known && {
+            let current: Option<String> = conn
+                .query_row(&format!("SELECT updated_at FROM {tbl} WHERE uuid=?1"), [&uuid], |r| r.get(0))
+                .ok()
+                .flatten();
+            let gone = conn
+                .query_row("SELECT 1 FROM sync_tombstones WHERE uuid=?1", [&ref_uuid], |_| Ok(()))
+                .is_ok();
+            current.as_deref() == Some(referrer_ua.as_str()) && !gone
+        };
+        let id: Option<i64> = if keep {
+            conn.query_row(&format!("SELECT id FROM {ref_table} WHERE uuid=?1"), [&ref_uuid], |r| r.get(0))
+                .ok()
+        } else {
+            None
+        };
+        if keep && id.is_none() {
+            continue;
+        }
+        if let Some(id) = id {
+            if let Err(e) = conn.execute(
+                &format!("UPDATE {tbl} SET {fk_col}=?1 WHERE uuid=?2 AND updated_at=?3"),
+                rusqlite::params![id, uuid, referrer_ua],
+            ) {
+                applog::warn("SYNC", format!("fk pending repair failed {tbl}.{fk_col} uuid={uuid}: {e}"));
+            }
+        }
+        let _ = conn.execute(
+            "DELETE FROM sync_fk_pending WHERE tbl=?1 AND uuid=?2 AND fk_col=?3",
+            rusqlite::params![tbl, uuid, fk_col],
+        );
+    }
 }
 
 fn apply_entity(conn: &Connection, key: &[u8; 32], spec: &EntitySpec, rec: &SyncRecord, fk_fixups: &mut Vec<FkFixup>) -> Result<(), String> {
@@ -1281,23 +1422,43 @@ mod profile_server_tests {
 /// server's records back, and persist. Full-set each call (the dataset is
 /// small — a handful of servers/credentials); a `since` watermark is a later
 /// optimisation, not needed for correctness.
+/// Every outcome is written to the app log by `sync_with`.
 #[tauri::command]
 async fn sync_now(
     app: tauri::AppHandle,
     db_state: tauri::State<'_, DbState>,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
 ) -> Result<SyncReport, String> {
-    let session = cloud.session().await?;
-    sync_with(&app, &db_state, &cloud, &session).await
+    let session = cloud.session().await.ok();
+    sync_with(&app, &db_state, &cloud, session.as_ref()).await
 }
 
-/// `sync_now` over a session the caller already holds, so a command that also
-/// did other calls first keeps all of them on one server.
+/// `sync_now` with the sign-in the caller already holds, if any, so a command
+/// that also made other calls first keeps all of them on one server. A shared
+/// profile needs it; a personal one only when this install syncs over HTTP
+/// (`sync_backend`). Every outcome is written to the app log.
 async fn sync_with(
     app: &tauri::AppHandle,
     db_state: &DbState,
-    cloud: &cloud::CloudState,
-    session: &cloud::Session,
+    cloud: &std::sync::Arc<cloud::CloudState>,
+    session: Option<&cloud::Session>,
+) -> Result<SyncReport, String> {
+    let profile = db_state.active_profile.lock().ok().and_then(|p| p.clone()).unwrap_or_default();
+    let started = std::time::Instant::now();
+    let result = sync_with_inner(app, db_state, cloud, session).await;
+    let ms = started.elapsed().as_millis();
+    match &result {
+        Ok(r) => applog::info("SYNC", format!("'{profile}' synced: pushed {}, pulled {} ({ms} ms)", r.pushed, r.pulled)),
+        Err(e) => applog::error("SYNC", format!("'{profile}' sync failed after {ms} ms: {e}")),
+    }
+    result
+}
+
+async fn sync_with_inner(
+    app: &tauri::AppHandle,
+    db_state: &DbState,
+    cloud: &std::sync::Arc<cloud::CloudState>,
+    session: Option<&cloud::Session>,
 ) -> Result<SyncReport, String> {
     let profile = db_state
         .active_profile
@@ -1306,13 +1467,35 @@ async fn sync_with(
         .clone()
         .ok_or("[SYNC] NO_PROFILE_OPEN")?;
 
+    // A shared profile always syncs with the signed-in cloud server. A personal
+    // one goes wherever this install syncs (`sync_backend`): over HTTP it is
+    // tied to its server like any other; in an S3 bucket it is tied to no
+    // server (the bucket is chosen per install), so it needs no sign-in and
+    // skips the server checks below.
+    let existing_share: Option<String> = {
+        let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+        let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+        conn.query_row("SELECT value FROM sync_meta WHERE key='share_id'", [], |r| r.get(0)).ok()
+    };
+    let (shared_session, personal) = match &existing_share {
+        Some(_) => (Some(session.ok_or("[CLOUD] NOT_SIGNED_IN")?), None),
+        None => (None, Some(sync_backend::personal_transport(app, cloud, session)?)),
+    };
+    let server = match &personal {
+        Some(transport) => transport.server(),
+        None => shared_session.map(|s| s.base()),
+    };
+
     // Checked before anything goes out, the shared key refresh below included:
     // a server the profile isn't linked to could hand back a key it knows,
     // and every record pushed after that would be readable to it.
-    let unlinked = {
-        let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
-        let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
-        check_profile_server(conn, session.base())?
+    let unlinked = match server {
+        Some(base) => {
+            let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+            let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+            check_profile_server(conn, base)?
+        }
+        None => false,
     };
 
     // A shared profile's key can change under us: the owner rotates it whenever
@@ -1321,12 +1504,7 @@ async fn sync_with(
     // a key nobody else can open. Cheap (a primary-key point lookup) and
     // best-effort — offline or a hiccup just means we sync with what we have,
     // exactly as before this existed.
-    let existing_share: Option<String> = {
-        let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
-        let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
-        conn.query_row("SELECT value FROM sync_meta WHERE key='share_id'", [], |r| r.get(0)).ok()
-    };
-    if let Some(sid) = &existing_share {
+    if let (Some(sid), Some(session)) = (&existing_share, shared_session) {
         if let Some((_, my_secret)) = cloud.identity().await {
             if let Ok(grant) = cloud::share_dek(app, cloud, session, sid).await {
                 if let Ok(raw) = hex::decode(&grant.sealed_dek) {
@@ -1396,6 +1574,7 @@ async fn sync_with(
     // nothing — it can only pull, so sending records would just 403.
     let (remote, pushed) = if let Some((share_id, role)) = &share {
         let to_push: &[SyncRecord] = if role == "user" { &[] } else { &records };
+        let session = shared_session.ok_or("[CLOUD] NOT_SIGNED_IN")?;
         let remote = cloud::shared_sync_exchange(app, cloud, session, share_id, "", to_push).await?;
         (remote, to_push.len())
     } else {
@@ -1410,9 +1589,11 @@ async fn sync_with(
         // Send the local display name so the server can label this partition —
         // essential once `cloud_profile` is an opaque UUID for new profiles. For
         // legacy `main` the name equals the partition, so it's a harmless echo.
-        let remote =
-            cloud::sync_exchange(app, cloud, session, &cloud_profile, "", &to_push, Some(profile.as_str())).await?;
-        (remote, to_push.len())
+        let transport = personal
+            .as_ref()
+            .ok_or("[SYNC] SHARE_CHANGED: this profile's sharing changed during the sync; sync again")?;
+        let out = transport.exchange(&cloud_profile, &to_push, Some(profile.as_str())).await?;
+        (out.remote, out.pushed)
     };
     let pulled = remote.len();
 
@@ -1420,8 +1601,8 @@ async fn sync_with(
         let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
         apply_remote_records(conn, &dek, &remote, &hlc)?;
-        if unlinked {
-            link_profile_server(conn, session.base())?;
+        if let (true, Some(base)) = (unlinked, server) {
+            link_profile_server(conn, base)?;
         }
     }
     // Persist the merged vault so the applied changes survive a restart.
@@ -1460,6 +1641,63 @@ struct ProfileSyncStats {
     diff: Option<SyncDiff>,
 }
 
+/// Newest (stamp, entity_type) per uuid. A uuid can legitimately appear twice —
+/// a row re-created after an older delete keeps its tombstone — and a plain
+/// collect kept whichever came LAST (the tombstone), so a fully synced profile
+/// showed a permanent "N to receive" that nudged users toward Force push.
+fn newest_by_uuid(records: &[SyncRecord]) -> std::collections::HashMap<&str, (&str, &str)> {
+    let mut map: std::collections::HashMap<&str, (&str, &str)> = std::collections::HashMap::new();
+    // The reserved escrow record is bookkeeping, not user data.
+    for r in records.iter().filter(|r| r.entity_type != ESCROW_ETYPE) {
+        let e = map.entry(r.uuid.as_str()).or_insert((r.updated_at.as_str(), r.entity_type.as_str()));
+        if r.updated_at.as_str() > e.0 {
+            *e = (r.updated_at.as_str(), r.entity_type.as_str());
+        }
+    }
+    map
+}
+
+/// Compare this device's records with the cloud's view, by newest stamp per
+/// uuid. `server_names` (uuid → name) lets the diff name out-of-sync servers.
+fn compute_sync_diff(
+    local: &[SyncRecord],
+    server: &[SyncRecord],
+    server_names: &std::collections::HashMap<String, String>,
+) -> SyncDiff {
+    let local_map = newest_by_uuid(local);
+    let server_map = newest_by_uuid(server);
+
+    let mut in_sync = 0usize;
+    let mut needs_push = 0usize;
+    let mut needs_pull = 0usize;
+    let mut out: Vec<String> = Vec::new();
+
+    let mut uuids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    uuids.extend(local_map.keys());
+    uuids.extend(server_map.keys());
+    for u in uuids {
+        let l = local_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
+        let s = server_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
+        let is_server = local_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false)
+            || server_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false);
+        if l == s {
+            in_sync += 1;
+        } else {
+            if l > s {
+                needs_push += 1;
+            } else {
+                needs_pull += 1;
+            }
+            if is_server && out.len() < 20 {
+                if let Some(name) = server_names.get(u) {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    SyncDiff { in_sync, needs_push, needs_pull, out_of_sync_nodes: out }
+}
+
 /// Read-only sync + activity snapshot for the Profile panel. The recent-edits
 /// list is local and instant; the cloud diff is a best-effort dry run (an empty
 /// push that mutates nothing, then a local comparison) and is omitted on any
@@ -1477,6 +1715,8 @@ async fn profile_sync_stats(
         .clone()
         .ok_or("[SYNC] NO_PROFILE_OPEN")?;
     let session = cloud.session().await.ok();
+    // Built before the lock (no await under it); unused for a shared profile.
+    let personal = sync_backend::personal_transport(&app, &cloud, session.as_ref()).ok();
 
     // Local snapshot under the lock: records, DEK, routing, recent edits, and a
     // uuid→name map for servers so the diff can name what's out of sync.
@@ -1484,15 +1724,19 @@ async fn profile_sync_stats(
         let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
         let (dek, _created) = get_or_create_dek(conn)?;
-        // The cloud copy is only compared on the server this profile syncs
-        // with; one that hasn't synced yet has nothing there to compare.
-        let comparable = session
-            .as_ref()
-            .is_some_and(|s| matches!(check_profile_server(conn, s.base()), Ok(false)));
         let local = collect_local_records(conn, &dek, "")?;
         let share_id: Option<String> = conn
             .query_row("SELECT value FROM sync_meta WHERE key='share_id'", [], |r| r.get(0))
             .ok();
+        // The copy in sync storage is only compared where this profile syncs: a
+        // shared or HTTP one on the server it is linked to (one that hasn't
+        // synced yet has nothing there), an S3 one in this install's bucket.
+        let linked = |base: &str| matches!(check_profile_server(conn, base), Ok(false));
+        let comparable = match (&share_id, &personal) {
+            (Some(_), _) => session.as_ref().is_some_and(|s| linked(s.base())),
+            (None, Some(transport)) => transport.server().map_or(true, linked),
+            (None, None) => false,
+        };
         let share_role: Option<String> = conn
             .query_row("SELECT value FROM sync_meta WHERE key='share_role'", [], |r| r.get(0))
             .ok();
@@ -1562,60 +1806,16 @@ async fn profile_sync_stats(
 
     // Best-effort dry run: pure pull (empty push mutates nothing on the server).
     let diff = {
-        let pulled = match &session {
-            Some(session) if comparable => {
-                if let Some((share_id, _role)) = &share {
-                    cloud::shared_sync_exchange(&app, &cloud, session, share_id, "", &[]).await
-                } else {
-                    cloud::sync_exchange(&app, &cloud, session, &cloud_profile, "", &[], None).await
-                }
-            }
+        let pulled = match (&share, &personal) {
+            (Some((share_id, _role)), _) => match &session {
+                Some(session) if comparable => cloud::shared_sync_exchange(&app, &cloud, session, share_id, "", &[]).await,
+                _ => Err(String::new()),
+            },
+            (None, Some(transport)) if comparable => transport.index(&cloud_profile).await,
             _ => Err(String::new()),
         };
         match pulled {
-            Ok(server) => {
-                use std::collections::HashMap;
-                let local_map: HashMap<&str, (&str, &str)> = local
-                    .iter()
-                    .map(|r| (r.uuid.as_str(), (r.updated_at.as_str(), r.entity_type.as_str())))
-                    .collect();
-                let server_map: HashMap<&str, (&str, &str)> = server
-                    .iter()
-                    // The reserved escrow record is bookkeeping, not user data.
-                    .filter(|r| r.entity_type != ESCROW_ETYPE)
-                    .map(|r| (r.uuid.as_str(), (r.updated_at.as_str(), r.entity_type.as_str())))
-                    .collect();
-
-                let mut in_sync = 0usize;
-                let mut needs_push = 0usize;
-                let mut needs_pull = 0usize;
-                let mut out: Vec<String> = Vec::new();
-
-                let mut uuids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                uuids.extend(local_map.keys());
-                uuids.extend(server_map.keys());
-                for u in uuids {
-                    let l = local_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
-                    let s = server_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
-                    let is_server = local_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false)
-                        || server_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false);
-                    if l == s {
-                        in_sync += 1;
-                    } else {
-                        if l > s {
-                            needs_push += 1;
-                        } else {
-                            needs_pull += 1;
-                        }
-                        if is_server && out.len() < 20 {
-                            if let Some(name) = server_names.get(u) {
-                                out.push(name.clone());
-                            }
-                        }
-                    }
-                }
-                Some(SyncDiff { in_sync, needs_push, needs_pull, out_of_sync_nodes: out })
-            }
+            Ok(server) => Some(compute_sync_diff(&local, &server, &server_names)),
             Err(_) => None,
         }
     };
@@ -1923,9 +2123,7 @@ async fn import_shared_profile(
     }
     let dir = profiles_dir(&app)?;
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-    if profile_path(&app, &local_name)?.exists() {
-        return Err(format!("Profile '{}' already exists", local_name));
-    }
+    ensure_profile_name_free(&dir, &local_name)?;
     *db_state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(local_name.clone());
     // setup_master_db consumes a State handle; hand it a fresh one from `app` so
     // our own `db_state` stays usable for the sync_meta writes + sync below.
@@ -1967,7 +2165,7 @@ async fn import_shared_profile(
         return Err(e);
     }
     // Pull the shared data into the new profile.
-    match sync_with(&app, &db_state, &cloud, &session).await {
+    match sync_with(&app, &db_state, &cloud, Some(&session)).await {
         Ok(report) => Ok(report),
         Err(e) => {
             discard_half_built_profile(&app, &local_name);
@@ -2023,6 +2221,28 @@ async fn restore_personal_profile(
     local_name: String,
     vault_password: String,
 ) -> Result<SyncReport, String> {
+    let what = format!("'{local_name}' from cloud profile {cloud_profile}");
+    let result =
+        restore_personal_profile_inner(app, db_state, cloud, cloud_profile, local_name, vault_password).await;
+    match &result {
+        Ok(r) => applog::info("SYNC", format!("restored {what}: pulled {}", r.pulled)),
+        // A wrong password or a taken name is the user's input being refused, not a fault.
+        Err(e) if e.contains("ESCROW_UNSEAL_FAILED") || e.starts_with("Can't use '") || e.ends_with("already exists") => {
+            applog::warn("SYNC", format!("restore of {what} refused: {e}"))
+        }
+        Err(e) => applog::error("SYNC", format!("restore of {what} failed: {e}")),
+    }
+    result
+}
+
+async fn restore_personal_profile_inner(
+    app: tauri::AppHandle,
+    db_state: tauri::State<'_, DbState>,
+    cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
+    cloud_profile: String,
+    local_name: String,
+    vault_password: String,
+) -> Result<SyncReport, String> {
     // Validate up front so a bad name/empty password fails before any network.
     let cloud_profile = cloud_profile.trim().to_string();
     if cloud_profile.is_empty() {
@@ -2033,31 +2253,31 @@ async fn restore_personal_profile(
         return Err("Password cannot be empty".into());
     }
 
-    // Peek at the cloud stream (empty push) and lift the escrow record out.
-    let session = cloud.session().await?;
-    let peek = cloud::sync_exchange(&app, &cloud, &session, &cloud_profile, "", &[], None).await?;
-    let sealed = peek
-        .iter()
-        .find(|r| r.entity_type == ESCROW_ETYPE && r.uuid == ESCROW_UUID)
-        .and_then(|r| r.blob.clone())
-        .ok_or("[SYNC] NO_ESCROW: no restorable copy of that profile in your cloud. Open it on the original device and sync once, then try again.")?;
+    // Fetch the published escrow blob(s). Normally exactly one; an object store
+    // can briefly hold two while a device replaces it, so each is tried below.
+    let session = cloud.session().await.ok();
+    let transport = sync_backend::personal_transport(&app, &cloud, session.as_ref())?;
+    let sealed = transport.escrows(&cloud_profile).await?;
+    if sealed.is_empty() {
+        return Err("[SYNC] NO_ESCROW: no restorable copy of that profile in your cloud. Open it on the original device and sync once, then try again.".into());
+    }
 
     // Re-derive the master key from the password (Argon2id → blocking pool) and
     // unseal the DEK. A wrong password fails the GCM tag → surfaced as a wrong
     // password below.
     let pw_for_escrow = vault_password.clone();
-    let dek = tokio::task::spawn_blocking(move || open_pw_escrow(&sealed, &pw_for_escrow))
-        .await
-        .map_err(|e| format!("[SYNC] ESCROW_JOIN: {e}"))?
-        .map_err(|_| "[SYNC] ESCROW_UNSEAL_FAILED: wrong password for this profile")?;
+    let dek = tokio::task::spawn_blocking(move || {
+        sealed.iter().find_map(|blob| open_pw_escrow(blob, &pw_for_escrow).ok())
+    })
+    .await
+    .map_err(|e| format!("[SYNC] ESCROW_JOIN: {e}"))?
+    .ok_or("[SYNC] ESCROW_UNSEAL_FAILED: wrong password for this profile")?;
     let dek_hex = hex::encode(dek);
 
     // Create the local vault (fresh profile) — same steps as create_profile.
     let dir = profiles_dir(&app)?;
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-    if profile_path(&app, &local_name)?.exists() {
-        return Err(format!("Profile '{}' already exists", local_name));
-    }
+    ensure_profile_name_free(&dir, &local_name)?;
     *db_state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(local_name.clone());
     {
         use tauri::Manager as _;
@@ -2089,14 +2309,16 @@ async fn restore_personal_profile(
             [&cloud_profile],
         )
         .map_err(|e| format!("[SYNC] SET_CLOUD_PROFILE: {e}"))?;
-        link_profile_server(conn, session.base())?;
+        if let Some(base) = transport.server() {
+            link_profile_server(conn, base)?;
+        }
         Ok(())
     })();
     if let Err(e) = seeded {
         discard_half_built_profile(&app, &local_name);
         return Err(e);
     }
-    match sync_with(&app, &db_state, &cloud, &session).await {
+    match sync_with(&app, &db_state, &cloud, session.as_ref()).await {
         Ok(report) => Ok(report),
         Err(e) => {
             discard_half_built_profile(&app, &local_name);
@@ -2161,7 +2383,7 @@ async fn rotate_share_dek(
         // replaced. They simply can't decrypt until re-invited, which is the
         // safe direction to fail.
         if let Err(e) = cloud::invite_member(app, cloud, session, share_id, &m.email, &m.role, &sealed).await {
-            eprintln!("[SHARE] re-seal failed for {}: {e}", m.email);
+            applog::warn("SHARE", format!("re-seal failed for {}: {e}", m.email));
         }
     }
 
@@ -2252,6 +2474,10 @@ struct ProfileShareStatus {
     identity_unlocked: bool,
     signed_in: bool,
     email: Option<String>,
+    /// Which transport personal (unshared) profiles sync over on this install.
+    backend: sync_backend::Backend,
+    /// Personal sync can run: signed in (HTTP) or configured (S3).
+    personal_sync_ready: bool,
     /// The server this profile syncs with; `None` while it isn't linked yet.
     cloud_server: Option<String>,
     /// The sync server in use.
@@ -2266,6 +2492,7 @@ struct ProfileShareStatus {
 /// sharing identity are ready. The member roster is fetched separately.
 #[tauri::command]
 async fn profile_share_status(
+    app: tauri::AppHandle,
     db_state: tauri::State<'_, DbState>,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
 ) -> Result<ProfileShareStatus, String> {
@@ -2291,6 +2518,7 @@ async fn profile_share_status(
         }
     };
     let st = cloud.status().await;
+    let (backend, personal_sync_ready) = sync_backend::personal_sync_status(&app, &cloud).await;
     let current_server = cloud.base().await;
     Ok(ProfileShareStatus {
         profile,
@@ -2299,6 +2527,8 @@ async fn profile_share_status(
         identity_unlocked: cloud.identity().await.is_some(),
         signed_in: st.signed_in,
         email: st.email,
+        backend,
+        personal_sync_ready,
         cloud_server,
         custom_server: current_server != cloud::CLOUD_API_BASE,
         current_server,
@@ -2371,7 +2601,7 @@ async fn stop_sharing(
         // vault stayed pointed at a dead share that errored on every sync
         // forever. Best-effort tell the server, then clear regardless.
         if let Err(e) = cloud::leave_share(&app, &cloud, &session, &share_id).await {
-            eprintln!("[SHARE] leave_share failed, clearing locally anyway: {e}");
+            applog::warn("SHARE", format!("leave_share failed, clearing locally anyway: {e}"));
         }
     }
     {
@@ -2942,6 +3172,277 @@ mod sync_engine_tests {
             "the corrupt record must be skipped, never inserted",
         );
     }
+
+    /// Device A's server 's1' linked to credential 'c', split into the two
+    /// records an object store can deliver in separate syncs.
+    fn server_and_its_credential() -> (SyncRecord, SyncRecord) {
+        let (a, _ha) = device("A");
+        a.execute("INSERT INTO credentials(name, auth_type, username) VALUES('c','password','root')", []).unwrap();
+        a.execute(
+            "INSERT INTO servers(name, host, port, credential_id) VALUES('s1','h',22,(SELECT id FROM credentials WHERE name='c'))",
+            [],
+        )
+        .unwrap();
+        let recs = collect_local_records(&a, &KEY, "").unwrap();
+        let pick = |t: &str| recs.iter().find(|r| r.entity_type == t).unwrap().clone();
+        (pick("servers"), pick("credentials"))
+    }
+
+    fn linked_credential(c: &Connection) -> Option<String> {
+        c.query_row(
+            "SELECT (SELECT name FROM credentials k WHERE k.id = s.credential_id) FROM servers s WHERE s.name='s1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn pending_count(c: &Connection) -> i64 {
+        c.query_row("SELECT COUNT(*) FROM sync_fk_pending", [], |r| r.get(0)).unwrap()
+    }
+
+    // Object stores list page by page, so a server can arrive one sync before
+    // the credential it points at. The link must be repaired when the
+    // credential lands — not left NULL forever because the server's stamp
+    // no longer looks new.
+    #[test]
+    fn a_late_referent_repairs_the_link_on_a_later_sync() {
+        let (server, cred) = server_and_its_credential();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&server), &hb).unwrap();
+        assert_eq!(linked_credential(&b), None, "precondition: the referent hasn't arrived");
+        assert_eq!(pending_count(&b), 1, "the intended link must be remembered");
+
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&cred), &hb).unwrap();
+        assert_eq!(linked_credential(&b).as_deref(), Some("c"), "the link must be repaired");
+        assert_eq!(pending_count(&b), 0);
+        let ua: String = b.query_row("SELECT updated_at FROM servers WHERE name='s1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ua, server.updated_at, "the repair must not re-stamp the server (it would push as a new edit)");
+    }
+
+    // Once this device edits the server itself, that edit owns the column —
+    // a late referent must not overwrite it.
+    #[test]
+    fn a_pending_link_yields_to_a_local_edit() {
+        let (server, cred) = server_and_its_credential();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&server), &hb).unwrap();
+        b.execute("UPDATE servers SET host='h2' WHERE name='s1'", []).unwrap();
+
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&cred), &hb).unwrap();
+        assert_eq!(linked_credential(&b), None, "the local edit's NULL link stands");
+        assert_eq!(pending_count(&b), 0, "a stale pending link is dropped");
+    }
+
+    #[test]
+    fn a_pending_link_to_a_deleted_referent_is_dropped() {
+        let (server, cred) = server_and_its_credential();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, std::slice::from_ref(&server), &hb).unwrap();
+        assert_eq!(pending_count(&b), 1);
+
+        let tomb = SyncRecord {
+            uuid: cred.uuid.clone(),
+            entity_type: "credentials".into(),
+            updated_at: format!("{}x", cred.updated_at),
+            deleted: true,
+            blob: None,
+        };
+        apply_remote_records(&b, &KEY, &[tomb, cred], &hb).unwrap();
+        assert_eq!(linked_credential(&b), None);
+        assert_eq!(pending_count(&b), 0, "a referent that's been deleted is never coming");
+    }
+
+    #[test]
+    fn no_pending_link_when_the_referent_is_already_deleted() {
+        let (server, cred) = server_and_its_credential();
+        let (b, hb) = device("B");
+        let tomb = SyncRecord {
+            uuid: cred.uuid,
+            entity_type: "credentials".into(),
+            updated_at: format!("{}x", cred.updated_at),
+            deleted: true,
+            blob: None,
+        };
+        apply_remote_records(&b, &KEY, &[tomb], &hb).unwrap();
+        apply_remote_records(&b, &KEY, &[server], &hb).unwrap();
+        assert_eq!(pending_count(&b), 0);
+    }
+
+    // A row re-created after an older delete keeps its tombstone, so the uuid
+    // appears twice locally. Stats must compare the NEWEST stamp, or a fully
+    // synced profile shows "1 to receive" forever.
+    #[test]
+    fn stats_compare_the_newest_stamp_per_uuid() {
+        let rec = |ua: &str, deleted: bool| SyncRecord {
+            uuid: "u1".into(),
+            entity_type: "servers".into(),
+            updated_at: ua.into(),
+            deleted,
+            blob: None,
+        };
+        let local = vec![rec("000000000000002:00000:A", false), rec("000000000000001:00000:A", true)];
+        let server = vec![rec("000000000000002:00000:A", false)];
+        let d = compute_sync_diff(&local, &server, &std::collections::HashMap::new());
+        assert_eq!((d.in_sync, d.needs_push, d.needs_pull), (1, 0, 0));
+    }
+
+    // ---- Two devices converging through an object store -------------------
+
+    use crate::object_sync::{mem::MemStore, ObjectSync};
+    use crate::sync_backend::SyncTransport;
+
+    /// One sync_now round for an in-memory device: collect → exchange → apply.
+    async fn bucket_sync(conn: &Connection, hlc: &hlc::Hlc, bucket: &dyn SyncTransport) {
+        let recs = collect_local_records(conn, &KEY, "").unwrap();
+        let out = bucket.exchange("p1", &recs, Some("work")).await.unwrap();
+        apply_remote_records(conn, &KEY, &out.remote, hlc).unwrap();
+    }
+
+    fn host_of(c: &Connection, name: &str) -> Option<String> {
+        c.query_row("SELECT host FROM servers WHERE name=?1", [name], |r| r.get(0)).ok()
+    }
+
+    #[tokio::test]
+    async fn two_devices_converge_through_a_bucket() {
+        let store = MemStore::new();
+        let bucket = ObjectSync::new(std::sync::Arc::clone(&store), "submarine/sync");
+        let (a, ha) = device("A");
+        let (b, hb) = device("B");
+        a.execute("INSERT INTO ssh_keys(name, public_key, private_key) VALUES('k','pub','priv')", []).unwrap();
+        a.execute("INSERT INTO credentials(name, auth_type, username, key_id) VALUES('c','key','root',(SELECT id FROM ssh_keys WHERE name='k'))", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port, credential_id) VALUES('web','h1',22,(SELECT id FROM credentials WHERE name='c'))", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port) VALUES('db','h9',22)", []).unwrap();
+        bucket_sync(&a, &ha, &bucket).await;
+        bucket_sync(&b, &hb, &bucket).await;
+        assert_eq!(host_of(&b, "web").as_deref(), Some("h1"));
+        assert_eq!(linked_credential_named(&b, "web").as_deref(), Some("c"), "links resolve across devices");
+
+        // B edits one server and deletes the other; A picks both up.
+        b.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        b.execute("DELETE FROM servers WHERE name='db'", []).unwrap();
+        bucket_sync(&b, &hb, &bucket).await;
+        bucket_sync(&a, &ha, &bucket).await;
+        assert_eq!(host_of(&a, "web").as_deref(), Some("h2"));
+        assert_eq!(host_of(&a, "db"), None, "the delete propagates");
+
+        // Settled: another round on each side moves nothing.
+        let quiet = |c: &Connection| collect_local_records(c, &KEY, "").unwrap();
+        let out_a = bucket.exchange("p1", &quiet(&a), None).await.unwrap();
+        let out_b = bucket.exchange("p1", &quiet(&b), None).await.unwrap();
+        assert_eq!((out_a.pushed, out_a.remote.len(), out_b.pushed, out_b.remote.len()), (0, 0, 0, 0));
+    }
+
+    fn linked_credential_named(c: &Connection, server: &str) -> Option<String> {
+        c.query_row(
+            "SELECT (SELECT name FROM credentials k WHERE k.id = s.credential_id) FROM servers s WHERE s.name=?1",
+            [server],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    // Both devices edit the same server offline. The newer edit wins on both,
+    // and the losing edit is still in the bucket (superseded, not destroyed).
+    #[tokio::test]
+    async fn concurrent_offline_edits_newest_wins_and_the_loser_is_kept() {
+        let store = MemStore::new();
+        let bucket = ObjectSync::new(std::sync::Arc::clone(&store), "submarine/sync");
+        let (a, ha) = device("A");
+        let (b, hb) = device("B");
+        a.execute("INSERT INTO servers(name, host, port) VALUES('web','h1',22)", []).unwrap();
+        bucket_sync(&a, &ha, &bucket).await;
+        bucket_sync(&b, &hb, &bucket).await;
+
+        a.execute("UPDATE servers SET host='from-a' WHERE name='web'", []).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        b.execute("UPDATE servers SET host='from-b' WHERE name='web'", []).unwrap();
+        // The OLDER edit syncs last — it must still lose.
+        bucket_sync(&b, &hb, &bucket).await;
+        bucket_sync(&a, &ha, &bucket).await;
+        bucket_sync(&b, &hb, &bucket).await;
+        assert_eq!(host_of(&a, "web").as_deref(), Some("from-b"));
+        assert_eq!(host_of(&b, "web").as_deref(), Some("from-b"));
+        let versions = store.keys().iter().filter(|k| k.contains("/r/servers/")).count();
+        assert_eq!(versions, 3, "original, loser and winner are all retained");
+
+        // Past retention, cleanup keeps only the winner.
+        store.age_all(31 * 24 * 3600);
+        bucket_sync(&a, &ha, &bucket).await;
+        let versions = store.keys().iter().filter(|k| k.contains("/r/servers/")).count();
+        assert_eq!(versions, 1);
+        assert_eq!(host_of(&a, "web").as_deref(), Some("from-b"));
+    }
+
+    // A device lists the bucket between another device's credential and server
+    // uploads landing (simulated: the credential object is missing at first).
+    // The link must be repaired by a later sync, not lost.
+    #[tokio::test]
+    async fn a_server_listed_before_its_credential_is_linked_later() {
+        let store = MemStore::new();
+        let bucket = ObjectSync::new(std::sync::Arc::clone(&store), "submarine/sync");
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO credentials(name, auth_type, username) VALUES('c','password','root')", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port, credential_id) VALUES('web','h1',22,(SELECT id FROM credentials WHERE name='c'))", []).unwrap();
+        bucket_sync(&a, &ha, &bucket).await;
+
+        let cred_key = store.keys().into_iter().find(|k| k.contains("/r/credentials/")).unwrap();
+        let held = store.objects.lock().unwrap().remove(&cred_key).unwrap();
+        let (b, hb) = device("B");
+        bucket_sync(&b, &hb, &bucket).await;
+        assert_eq!(linked_credential_named(&b, "web"), None, "precondition: the credential wasn't listed");
+
+        store.objects.lock().unwrap().insert(cred_key, held);
+        bucket_sync(&b, &hb, &bucket).await;
+        assert_eq!(linked_credential_named(&b, "web").as_deref(), Some("c"));
+    }
+
+    /// Settings for a real S3-compatible endpoint, or None to skip. Set
+    /// SUBMARINE_S3_IT=1 plus SUBMARINE_S3_IT_CFG (s3cmd config path),
+    /// SUBMARINE_S3_IT_BUCKET and optionally SUBMARINE_S3_IT_ENDPOINT.
+    pub(crate) fn it_settings() -> Option<sync_backend::S3Settings> {
+        if std::env::var("SUBMARINE_S3_IT").ok()? != "1" {
+            return None;
+        }
+        Some(sync_backend::S3Settings {
+            credentials_file: std::env::var("SUBMARINE_S3_IT_CFG").ok()?,
+            bucket: std::env::var("SUBMARINE_S3_IT_BUCKET").ok()?,
+            prefix: format!("submarine-it/{}", new_entity_uuid()),
+            endpoint: std::env::var("SUBMARINE_S3_IT_ENDPOINT").ok(),
+            region: std::env::var("SUBMARINE_S3_IT_REGION").ok(),
+            path_style: std::env::var("SUBMARINE_S3_IT_VHOST").ok().as_deref() != Some("1"),
+        })
+    }
+
+    #[tokio::test]
+    async fn it_two_devices_converge_through_a_real_s3_endpoint() {
+        let Some(settings) = it_settings() else { return };
+        let bucket = sync_backend::s3_transport(&settings, &Default::default()).unwrap();
+        let (a, ha) = device("A");
+        let (b, hb) = device("B");
+        a.execute("INSERT INTO credentials(name, auth_type, username) VALUES('c','password','root')", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port, credential_id) VALUES('web','h1',22,(SELECT id FROM credentials WHERE name='c'))", []).unwrap();
+        a.execute("INSERT INTO servers(name, host, port) VALUES('db','h9',22)", []).unwrap();
+        bucket_sync(&a, &ha, bucket.as_ref()).await;
+        bucket_sync(&b, &hb, bucket.as_ref()).await;
+        assert_eq!(linked_credential_named(&b, "web").as_deref(), Some("c"));
+
+        b.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        b.execute("DELETE FROM servers WHERE name='db'", []).unwrap();
+        bucket_sync(&b, &hb, bucket.as_ref()).await;
+        bucket_sync(&a, &ha, bucket.as_ref()).await;
+        assert_eq!(host_of(&a, "web").as_deref(), Some("h2"));
+        assert_eq!(host_of(&a, "db"), None);
+
+        let profiles = bucket.list_profiles().await.unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!((profiles[0].profile.as_str(), profiles[0].name.as_str(), profiles[0].live_records), ("p1", "work", 2));
+        let stats = compute_sync_diff(&collect_local_records(&a, &KEY, "").unwrap(), &bucket.index("p1").await.unwrap(), &Default::default());
+        assert_eq!((stats.needs_push, stats.needs_pull), (0, 0));
+
+        assert!(bucket.delete_profile("p1").await.unwrap() >= 5);
+        assert!(bucket.list_profiles().await.unwrap().is_empty(), "test prefix must be left empty");
+    }
 }
 
 /// Async-friendly vault save. Snapshots the key/salt/path under the sync
@@ -2991,7 +3492,9 @@ async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<String>, Stri
             }
         }
     }
-    out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    // Case-insensitive order reads naturally; names equal but for case (two
+    // profiles on a case-sensitive disk) then sort exactly, so the order is stable.
+    out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
     Ok(out)
 }
 
@@ -3006,8 +3509,8 @@ async fn cloud_list_sync_profiles(
     app: tauri::AppHandle,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
 ) -> Result<Vec<cloud::SyncProfileInfo>, String> {
-    let session = cloud.session().await?;
-    cloud::list_sync_profiles(&app, &cloud, &session).await
+    let session = cloud.session().await.ok();
+    sync_backend::personal_transport(&app, &cloud, session.as_ref())?.list_profiles().await
 }
 
 /// Delete one of the caller's OWN personal profiles from the cloud: wipes every
@@ -3026,8 +3529,16 @@ async fn cloud_delete_profile(
     if profile.is_empty() {
         return Err("[SYNC] NO_PROFILE_NAME".into());
     }
-    let session = cloud.session().await?;
-    cloud::delete_sync_profile(&app, &cloud, &session, &profile).await
+    let session = cloud.session().await.ok();
+    let result = match sync_backend::personal_transport(&app, &cloud, session.as_ref()) {
+        Ok(transport) => transport.delete_profile(&profile).await,
+        Err(e) => Err(e),
+    };
+    match &result {
+        Ok(n) => applog::info("SYNC", format!("deleted cloud profile {profile} ({n} records)")),
+        Err(e) => applog::error("SYNC", format!("deleting cloud profile {profile} failed: {e}")),
+    }
+    result
 }
 
 /// Replace this profile's entire cloud copy with what's on THIS device.
@@ -3057,11 +3568,10 @@ async fn force_push_profile(
         .map_err(|_| "[STATE] LOCK_PROFILE")?
         .clone()
         .ok_or("[SYNC] NO_PROFILE_OPEN")?;
-    let session = cloud.session().await?;
+    let session = cloud.session().await.ok();
     let (share_id, cloud_profile) = {
         let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
-        check_profile_server(conn, session.base())?;
         let sid: Option<String> = conn
             .query_row("SELECT value FROM sync_meta WHERE key='share_id'", [], |r| r.get(0))
             .ok();
@@ -3073,11 +3583,19 @@ async fn force_push_profile(
     if share_id.is_some() {
         return Err("[SYNC] SHARED_PROFILE: this profile is shared with other people, and replacing the cloud copy would delete their changes too. Stop sharing first if you really want to reset it.".into());
     }
-    let removed = cloud::delete_sync_profile(&app, &cloud, &session, &cloud_profile).await?;
-    eprintln!("[SYNC] force push: server dropped {removed} record(s) for '{cloud_profile}'");
+    // Personal profiles go wherever this install syncs; only one tied to a
+    // server (HTTP) has to be on that server before its copy there is wiped.
+    let transport = sync_backend::personal_transport(&app, &cloud, session.as_ref())?;
+    if let Some(base) = transport.server() {
+        let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+        let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+        check_profile_server(conn, base)?;
+    }
+    let removed = transport.delete_profile(&cloud_profile).await?;
+    applog::warn("SYNC", format!("force push: server dropped {removed} record(s) for '{cloud_profile}'"));
     // Pushes are always a full set, so the very next sync repopulates the
     // partition from this vault — including a fresh DEK escrow record.
-    sync_with(&app, &db_state, &cloud, &session).await
+    sync_with(&app, &db_state, &cloud, session.as_ref()).await
 }
 
 /// Mark a profile as the active one. Subsequent `check_db_exists` /
@@ -3210,6 +3728,7 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<()
     // the profile itself is already gone, so a locked tmp shouldn't fail the
     // delete the user asked for.
     let _ = fs::remove_file(path.with_extension("submarine.tmp"));
+    applog::info("PROFILE", format!("removed local profile '{name}'"));
     Ok(())
 }
 
@@ -3395,10 +3914,8 @@ async fn import_profile_bytes(
 
     let dir = profiles_dir(&app_handle)?;
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
+    ensure_profile_name_free(&dir, &name)?;
     let dst = profile_path(&app_handle, &name)?;
-    if dst.exists() {
-        return Err(format!("Profile '{}' already exists", name));
-    }
     fs::write(&dst, &bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", dst, e))?;
     Ok(())
 }
@@ -3458,10 +3975,8 @@ async fn import_profile_save(
 
     let dir = profiles_dir(&app_handle)?;
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
+    ensure_profile_name_free(&dir, &name)?;
     let dst = profile_path(&app_handle, &name)?;
-    if dst.exists() {
-        return Err(format!("Profile '{}' already exists", name));
-    }
 
     // Single-read import: load the file into memory ONCE, validate the
     // header on the in-memory bytes, then write to the destination. The
@@ -3478,6 +3993,7 @@ async fn import_profile_save(
 
     fs::write(&dst, &bytes)
         .map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", dst, e))?;
+    applog::info("PROFILE", format!("imported profile '{name}'"));
     Ok(())
 }
 
@@ -3802,7 +4318,7 @@ async fn setup_master_db_inner(
                 needs_resave = true;
             }
             Err(e) => {
-                eprintln!("[DATABASE] VACUUM_SKIPPED: {}", e);
+                applog::warn("DATABASE", format!("VACUUM_SKIPPED: {e}"));
             }
         }
     }
@@ -3913,11 +4429,8 @@ async fn create_profile(
     }
     let dir = profiles_dir(&app_handle)?;
     fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-    let path = profile_path(&app_handle, &name)?;
-    if path.exists() {
-        return Err(format!("Profile '{}' already exists", name));
-    }
-    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name);
+    ensure_profile_name_free(&dir, &name)?;
+    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name.clone());
     // Reuse setup_master_db's fresh-schema branch by deferring to it. Empty
     // profile starts with the same migrations the legacy path would do.
     setup_master_db(app_handle.clone(), password, state).await?;
@@ -3956,6 +4469,7 @@ async fn create_profile(
         .map_err(|e| format!("[STATE] CLOUD_SERVER_STORE: {e}"))?;
     }
     save_vault_internal(&db_state)?;
+    applog::info("PROFILE", format!("created profile '{name}'"));
     Ok(())
 }
 
@@ -5660,7 +6174,7 @@ impl SecretPromptCtx<'_> {
     /// newer attempt's).
     fn log(&self, msg: &str, ty: &str) {
         use tauri::Emitter;
-        println!("[LOG-{}] {}", self.session_id, msg);
+        applog::by_kind(ty, "SSH", format!("[{}] {msg}", self.session_id));
         if !self.attempt.is_current_now() {
             return;
         }
@@ -6406,7 +6920,7 @@ async fn emit_connection_failed(
     if attempt.is_current().await {
         let _ = app.emit(&format!("connection-failed-{}", session_id), payload);
     } else {
-        println!("[BACKEND] {}: dropped the failure report of a superseded connect attempt", session_id);
+        applog::info("SSH", format!("[{session_id}] dropped the failure report of a superseded connect attempt"));
     }
 }
 
@@ -6431,7 +6945,7 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     use tauri::Emitter;
 
     let log = |msg: &str, ty: &str| {
-        println!("[LOG-{}] {}", session_id, msg);
+        applog::by_kind(ty, "SSH", format!("[{session_id}] {msg}"));
         // A superseded attempt stays out of the tab's log.
         if !attempt.is_current_now() {
             return;
@@ -7127,7 +7641,7 @@ async fn connect_jump_host(
     use tauri::Emitter;
 
     let log = |msg: &str, ty: &str| {
-        println!("[LOG-{}] [jump] {}", session_id, msg);
+        applog::by_kind(ty, "SSH", format!("[{session_id}] [jump] {msg}"));
         // A superseded attempt stays out of the tab's log.
         if !attempt.is_current_now() {
             return;
@@ -7421,7 +7935,7 @@ async fn initiate_connection(
     //   - "sftp" secondary         → no
     let start_tunnels_inline = role == "primary" && !separate;
 
-    println!("[BACKEND] initiate_connection invoked for session_id: {} (role: {}, separate: {}), server_id: {}", session_id, role, separate, server_id);
+    applog::info("SSH", format!("[{session_id}] connect requested (role: {role}, separate: {separate}), server_id: {server_id}"));
 
     // Reconnect path: if a previous session under this id is still registered,
     // tear it down before starting the fresh handshake. Without this, the
@@ -7432,7 +7946,7 @@ async fn initiate_connection(
     {
         let mut conns = state.connections.lock().await;
         if conns.remove(&session_id).is_some() {
-            println!("[BACKEND] Tearing down stale session for reconnect: {}", session_id);
+            applog::info("SSH", format!("[{session_id}] tearing down stale session for reconnect"));
         }
     }
     // Drop any ProxyJump bastion handle from a prior attempt — dropping it
@@ -7465,7 +7979,6 @@ async fn initiate_connection(
         connect_generation,
     );
 
-    println!("[BACKEND] No duplicates found. Registering oneshot channel and spawning connection worker...");
     let (fp_tx, fp_rx) = tokio::sync::oneshot::channel();
     // Random per-connect nonce — keys the fp_txs map so a stale `accept`
     // for one attempt (frontend bug, malicious IPC call, retry race)
@@ -7726,7 +8239,6 @@ async fn initiate_connection(
     let mirrors_owned: MirrorMap = mirrors.inner().clone();
 
     tauri::async_runtime::spawn(async move {
-        println!("[BACKEND WORKER] Started connection worker thread for session: {}", session_id_clone);
 
         struct FpCleanupGuard {
             fp_txs: Arc<Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
@@ -7753,7 +8265,7 @@ async fn initiate_connection(
         };
 
         let emit_log = |msg: &str, log_type: &str| {
-            println!("[LOG-{}] {}", session_id_clone, msg);
+            applog::by_kind(log_type, "SSH", format!("[{session_id_clone}] {msg}"));
             // Once a newer attempt (or a disconnect) has replaced this one,
             // its lines would read as the newer attempt's — keep them out.
             if !attempt.is_current_now() {
@@ -7787,12 +8299,24 @@ async fn initiate_connection(
         emit_log(&format!("[DEBUG] SQLite DB key_id: {:?}", db_key_id), "info");
         emit_log(&format!("[DEBUG] effective_key_id determined: {:?}", effective_key_id), "info");
         if let Some((ref priv_key, ref passphrase, _)) = key_data {
-            emit_log(&format!("[DEBUG] SSH Key loaded from DB. Private Key length: {} chars, Has Passphrase: {}", priv_key.len(), passphrase.is_some()), "info");
+            emit_log(&format!("[DEBUG] SSH Key loaded from DB. Private Key length: {} chars, {}", priv_key.len(), if passphrase.is_some() { "with a passphrase" } else { "no passphrase" }), "info");
             if priv_key.trim().is_empty() {
                 emit_log("[DEBUG] WARNING: SSH Key content is EMPTY!", "error");
             } else {
-                let first_line = priv_key.lines().next().unwrap_or("");
-                emit_log(&format!("[DEBUG] SSH Key Header: {}", first_line), "info");
+                // Name the format, never echo the line: a key pasted without
+                // its armour line would put key material here.
+                let first_line = priv_key.lines().next().unwrap_or("").trim();
+                let format = if first_line.starts_with("-----BEGIN ") && first_line.ends_with("-----") {
+                    match first_line.trim_matches('-').trim_start_matches("BEGIN ").trim_end_matches("PRIVATE KEY").trim() {
+                        "" => "PKCS#8",
+                        kind => kind,
+                    }
+                } else if first_line.starts_with("PuTTY-User-Key-File") {
+                    "PuTTY"
+                } else {
+                    "unrecognised (no PEM header)"
+                };
+                emit_log(&format!("[DEBUG] SSH key format: {format}"), "info");
             }
         } else {
             emit_log("[DEBUG] No SSH Key was loaded from database for this session.", "info");
@@ -12431,13 +12955,13 @@ async fn sftp_open_remote_file(
         let mut debouncer = match new_debouncer(std::time::Duration::from_millis(750), raw_tx) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[sftp-live-edit] debouncer init failed: {} — falling back to no autosync", e);
+                applog::warn("SFTP", format!("debouncer init failed: {} — falling back to no autosync", e));
                 let _ = std::fs::remove_file(&temp_file_path_clone);
                 return;
             }
         };
         if let Err(e) = debouncer.watcher().watch(&temp_file_path_clone, RecursiveMode::NonRecursive) {
-            eprintln!("[sftp-live-edit] watch failed: {} — falling back to no autosync", e);
+            applog::warn("SFTP", format!("watch failed: {} — falling back to no autosync", e));
             let _ = std::fs::remove_file(&temp_file_path_clone);
             return;
         }
@@ -14816,18 +15340,35 @@ pub fn run() {
         // is the earliest hook we get an AppHandle, so initialise it there and
         // `manage` it for commands.
         .setup(|app| {
+            if let Ok(dir) = app.path().app_log_dir() {
+                applog::init(dir);
+            }
+            applog::info("APP", format!("Submarine {} started ({})", env!("CARGO_PKG_VERSION"), app.config().identifier));
+            // Decided before the log existed (portable::apply); recorded here.
+            match portable::current() {
+                portable::Decision::Standard => {}
+                portable::Decision::Portable(dir) => {
+                    applog::info("APP", format!("portable mode: data in {}", dir.display()))
+                }
+                portable::Decision::NotWritable { dir, reason } => applog::warn(
+                    "APP",
+                    format!("{} is not writable ({reason}); using the per-user folders", dir.display()),
+                ),
+            }
             let cloud_state = cloud::CloudState::new(&app.handle());
             app.manage(cloud_state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             check_db_exists, setup_master_db, persist_vault,
+            applog::app_log, applog::app_log_path,
             list_profiles, cloud_list_sync_profiles, cloud_delete_profile, force_push_profile, select_profile, create_profile, delete_profile, close_profile,
             export_profile, import_profile_pick, import_profile_save, import_profile_bytes,
             cloud::cloud_status, cloud::cloud_signup, cloud::cloud_consume_verify_link,
             cloud::cloud_set_password, cloud::cloud_login, cloud::cloud_logout,
             cloud::cloud_request_password_reset, cloud::cloud_reset_password,
             cloud::cloud_request_login_link, cloud::cloud_login_with_link,
+            sync_backend::sync_backend_get, sync_backend::sync_backend_set, sync_backend::s3_test_connection,
             cloud_config::cloud_get_config, cloud_config::cloud_set_config, cloud_config::cloud_test_connection,
             sync_now, move_profile_to_current_server,
             identity_status, setup_identity, reset_identity,
@@ -14895,6 +15436,32 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_profile_name_taken_in_any_letter_case_is_refused() {
+        let dir = std::env::temp_dir().join(format!("submarine-names-{}", new_entity_uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("e2e.submarine"), b"x").unwrap();
+        fs::write(dir.join("notes.txt"), b"x").unwrap();
+        fs::write(dir.join("half.submarine.tmp"), b"x").unwrap();
+
+        assert_eq!(ensure_profile_name_free(&dir, "work"), Ok(()));
+        assert_eq!(ensure_profile_name_free(&dir, "notes"), Ok(()), "only .submarine files are profiles");
+        assert_eq!(ensure_profile_name_free(&dir, "half"), Ok(()), "a leftover save isn't a profile");
+        assert_eq!(ensure_profile_name_free(&dir, "e2e"), Err("Profile 'e2e' already exists".into()));
+        // Refused on every platform, whatever the disk does with case.
+        for variant in ["E2e", "E2E"] {
+            let msg = ensure_profile_name_free(&dir, variant).unwrap_err();
+            assert!(msg.starts_with(&format!("Can't use '{variant}'")) && msg.contains("'e2e'"), "{msg}");
+        }
+        // A case-sensitive disk may still hold both from before this rule; the
+        // exact name then wins over its case variant.
+        if !dir.join("E2E.submarine").exists() {
+            fs::write(dir.join("E2e.submarine"), b"x").unwrap();
+            assert_eq!(ensure_profile_name_free(&dir, "E2e"), Err("Profile 'E2e' already exists".into()));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn dir_entry_name_rejects_traversal_and_separators() {
