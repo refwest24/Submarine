@@ -11,8 +11,9 @@ Phase 0."* It is written for an agent that has not seen this repository before.
   the build, not the GUI.
 - Read first, in this order: `CLAUDE.md` (rules), `TODO.md` ("Resume here" and the step 13.10 progress note),
   `LESSONS.md`, `docs/manual-tests.md` (§0 and the tests named below).
-- Linux Mint 22 is built on Ubuntu 24.04 (`noble`), but `lsb_release -c` says `wilma`. Stock Ubuntu packages
-  are fine; a third-party apt repository (NodeSource, say) needs `noble` written into its sources line by hand.
+- Linux Mint 22.x is built on Ubuntu 24.04 (`noble`), but `lsb_release -c` gives Mint's own codename (`wilma` on
+  22.0, `zena` on 22.3); `UBUNTU_CODENAME` in `/etc/os-release` says `noble`. Stock Ubuntu packages are fine; a
+  third-party apt repository needs `noble` written into its sources line by hand.
 
 ## How this session works
 
@@ -38,7 +39,7 @@ sudo apt update && sudo apt install -y build-essential curl file patchelf \
   libsoup-3.0-dev libjavascriptcoregtk-4.1-dev            # the list CI uses (.github/workflows/release.yml)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # then: . "$HOME/.cargo/env"
 cargo --version      # Cargo.toml says rust-version = "1.90"; anything current is fine
-node --version       # Vite 6 wants Node 20+; Mint's apt Node is too old — nvm, or NodeSource with `noble`
+node --version       # Vite 6.4 runs on Node 18, 20 or 22+; use a current LTS from nvm (apt's Node 18 is EOL)
 npm ci
 ```
 
@@ -64,17 +65,27 @@ npm run typecheck && npm run build
 ## Phase 2 — Build and launch a test copy
 
 `docs/manual-tests.md` §0 builds the two "devices" with `--bundles app`, which is macOS-only. On Linux build one
-copy with its own identifier and no bundle, and run the binary from `target/`:
+copy with its own identifier and no bundle, copy the binary out of `target/` under its own name, and run that:
 
 ```sh
 npx tauri build --debug --no-bundle \
   --config '{"identifier":"com.submarine.e2e.a","productName":"Submarine E2E A"}'
-ls -l src-tauri/target/debug/        # the binary is named after productName; run it from a terminal
+cp src-tauri/target/debug/submarine <somewhere>/submarine-e2e-a   # Cargo's name, not productName
+<somewhere>/submarine-e2e-a                                        # from a terminal, always by its path
 ```
 
-Run it from a terminal so WebKitGTK's messages are visible. Known WebKitGTK trouble on Linux, to try only if
-the window is blank or black: `WEBKIT_DISABLE_DMABUF_RENDERER=1 <binary>`; on NVIDIA + Wayland also
-`WEBKIT_DISABLE_COMPOSITING_MODE=1`. If either was needed, note it in `LESSONS.md` and the §0 recipe.
+**Always start a test copy by its path.** Tauri 2 doesn't rename the binary to `productName` (only
+`mainBinaryName` in the config would), so every build is `src-tauri/target/debug/submarine`: the next build
+overwrites it, and its name is the same as an installed Submarine's. If the `.deb` is installed here
+(`/usr/bin/submarine`; check with `dpkg -l submarine`), a bare `submarine` starts the real app on the real data.
+
+Run it from a terminal: the WebKit lines below go to stderr, not to the log file. The app already sets
+`WEBKIT_DISABLE_HARDWARE_ACCELERATION`, `WEBKIT_DISABLE_DMABUF_RENDERER`, `WEBKIT_DISABLE_COMPOSITING_MODE`,
+`GDK_BACKEND=x11` and `LIBGL_ALWAYS_SOFTWARE` on Linux unless they are already exported (`run()` in `lib.rs`),
+so exporting them yourself changes nothing. What is Linux-only is the web-content sandbox (`webkit_sandbox.rs`):
+note which `[webkit] web content sandbox: …` line appears. `ON (bubblewrap)` is expected where `/usr/bin/bwrap`
+works; `OFF, <reason>` means it doesn't, and the app runs unsandboxed. If the window is blank or black, try once
+with `SUBMARINE_DISABLE_WEBKIT_SANDBOX=1`; if that was needed, note it in `LESSONS.md` and the §0 recipe.
 
 Check, and then write the verified Linux recipe into `docs/manual-tests.md` §0 next to the macOS one:
 
@@ -87,7 +98,8 @@ Check, and then write the verified Linux recipe into `docs/manual-tests.md` §0 
 
 Second "device": the Mac copies from 2026-10-13 are gone. Cross-machine tests (§3, §4) need the user to rebuild
 one on the Mac (§0 recipe there) — ask whether they want that, or build a second Linux copy with
-`com.submarine.e2e.b` and run the two side by side (never two copies with the same identifier).
+`com.submarine.e2e.b`, copy it out as `submarine-e2e-b` the same way, and run the two side by side (never two
+copies with the same identifier).
 
 ## Phase 3 — Manual tests on Linux (scratch folder)
 
@@ -100,7 +112,7 @@ label first — `LESSONS.md`), then check the log and the data folder after each
 | §2 first sync | `e2e`, one server, a saved login linked to it, **Sync now** | `created profile`, `synced: pushed N`, `Cloud sync complete`; bucket objects if `s3cmd` is here |
 | **§8.7 Linux case rule** | with `e2e` here, **New profile** `E2e`; **Import** under `E2e` | refused inline, no profile created (ext4 is case-sensitive — this is the test only Linux can run); `WARN  [PROFILE] Can't use …` if the backend was reached |
 | §11.1 | unlock `e2e` with a wrong, then the right password | "Wrong password." and `WARN  [PICKER] opening 'e2e' failed: wrong password`; the right one opens `e2e` |
-| §6.1, §6.2 | bad bucket name; missing credentials file (`~/…/missing` — `~` must expand on Linux too) | readable messages; `BUCKET_NOT_FOUND`, then `CREDENTIALS_FILE` in panel, Activity Log and log |
+| §6.1, §6.2 | bad bucket name; missing credentials file (`~/…/missing` — `~` must expand on Linux too) | §6.1: a readable message, `BUCKET_NOT_FOUND` in the log. §6.2: panel and Activity Log say "Sync storage isn't set up: can't read …/missing …", the log has `ERROR [SYNC] … [S3] CREDENTIALS_FILE` |
 | §10.1 | **Manual** proxy `http://127.0.0.1:9` → **Test connection** | four `retrying after: [S3] ENDPOINT_UNREACHABLE` lines then the failed line; back to **System** works. Also note (don't fix) whether an `http_proxy` / `https_proxy` variable in the launching shell changes the **System** result |
 | §11.3 | **Refresh from cloud** with the missing credentials path | banner + `WARN  [PICKER] listing cloud profiles failed` |
 | §3, §4 | only with a second device (see Phase 2) | as the doc says |
@@ -133,11 +145,13 @@ Places worth a look even if the tests pass:
 This is the step that touches real data. Before anything else, back up the real app data on both machines
 (`~/.local/share/com.submarine.app` here, `~/Library/Application Support/com.submarine.app` on the Mac) and
 leave the old sync script's last object in the bucket as it is. Then a release build here
-(`npx tauri build --bundles deb` → `sudo apt install ./src-tauri/target/release/bundle/deb/*.deb`) and on the
-Mac, both pointed at `submarine/sync`; restore each profile on the machine that doesn't have it, edit on one
-and sync the other, and only then retire the old script. Don't use **Delete from cloud** on a real profile
-during acceptance — a device that still has the profile open uploads it again (open design item in
-`TODO.md`).
+(`npx tauri build --bundles deb` → `sudo apt install --reinstall ./src-tauri/target/release/bundle/deb/*.deb`)
+and on the Mac, both pointed at `submarine/sync`. The `--reinstall` matters when upstream's `.deb` is already
+installed: the fork's package has the same name and, unless the version was bumped, the same version, so plain
+`apt install` says it's already the newest version and installs nothing. Then restore each profile on the
+machine that doesn't have it, edit on one and sync the other, and only then retire the old script. Don't use
+**Delete from cloud** on a real profile during acceptance — a device that still has the profile open uploads it
+again (open design item in `TODO.md`).
 
 ## Reporting and the PR
 
